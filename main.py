@@ -14,11 +14,12 @@ from cisco_exos_translator.parser import (
     _parse_vlan_block,
 )
 from cisco_exos_translator.scanner import scan_config
+from cisco_exos_translator.validation import validate_parsed_config
 
 
 def parse_cisco_config(text: str) -> ParsedConfig:
     # Parse Cisco IOS/IOS-XE running-config text into a ParsedConfig IR.
-    # Orchestrates: scanner → parser passes → post-processing
+    # Orchestrates: scanner → parser passes → post-processing → validation.
     config = ParsedConfig()
 
     # Pass 1: scanner
@@ -39,6 +40,10 @@ def parse_cisco_config(text: str) -> ParsedConfig:
     # Pass 3: post-processing
     _link_port_channel_members(config)
     _infer_stack_members(config)
+
+    # Pass 4: validation
+    validation_warnings = validate_parsed_config(config)
+    config.warnings.extend(validation_warnings)
 
     return config
 
