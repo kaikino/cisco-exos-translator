@@ -1,10 +1,11 @@
-# Test Cisco L2 config parser.
+# Cisco IOS/IOS-XE L2 config -> EXOS (.xsf) translator.
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
+from cisco_exos_translator.generator import generate_exos_config
 from cisco_exos_translator.models import ParsedConfig
 from cisco_exos_translator.parser import (
     _infer_stack_members,
@@ -63,7 +64,7 @@ def parse_multiple_files(paths: list[str]) -> dict[str, ParsedConfig]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    # Parse Cisco config(s) and print results.
+    # Translate Cisco config(s) to EXOS .xsf files (one per input).
     if argv is None:
         argv = sys.argv[1:]
 
@@ -77,17 +78,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    # Print parse results
     for path, config in sorted(configs.items()):
-        print(f"\n{path}:")
-        print(f"  Hostname: {config.hostname}")
-        print(f"  VLANs: {sorted(config.vlans.keys())}")
-        print(f"  Interfaces: {len(config.interfaces)}")
-        print(f"  Port-channels: {list(config.port_channels.keys())}")
-        print(f"  Stack members: {list(config.stack_members.keys())}")
+        # Generate the EXOS script and write it next to the input as <name>.xsf.
+        exos_text = generate_exos_config(config)
+        out_path = Path(path).with_suffix(".xsf")
+        out_path.write_text(exos_text, encoding="utf-8")
+        print(f"{path} -> {out_path}")
 
+        # Parser/validation warnings (generation warnings are embedded in the .xsf).
         if config.warnings:
-            print(f"  Warnings:")
+            print("  Parse/validation warnings:", file=sys.stderr)
             for w in config.warnings:
                 print(f"    - {w}", file=sys.stderr)
 
