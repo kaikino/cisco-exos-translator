@@ -106,7 +106,7 @@ def _untagged_lines(port: str, vid: int, vlan_names: dict[int, str]) -> list[str
 # Render a port's switchport mode as EXOS "add ports" lines
 # access -> untagged on the access VLAN; trunk -> native untagged, rest tagged
 def _membership_lines(
-    port: str, iface, vlan_names: dict[int, str]
+    port: str, iface, vlan_names: dict[int, str], warnings: list[str]
 ) -> list[str]:
     lines: list[str] = []
 
@@ -121,7 +121,20 @@ def _membership_lines(
         native = iface.trunk_native_vlan
         if native is not None:
             lines.extend(_untagged_lines(port, native, vlan_names))
-        for vid in sorted(iface.trunk_allowed_vlans):
+
+        # A trunk with no allowed list carries all VLANs in Cisco; expand to
+        # every VLAN this config defines (excluding Default, which stays
+        # untagged) so the EXOS trunk actually carries traffic
+        allowed = iface.trunk_allowed_vlans
+        if not allowed:
+            allowed = {vid for vid in vlan_names if vid != 1}
+            warnings.append(
+                f"{iface.canonical_name}: trunk has no allowed-VLAN list (Cisco "
+                f"carries all VLANs); expanded to all {len(allowed)} non-Default "
+                f"VLANs defined on this switch"
+            )
+
+        for vid in sorted(allowed):
             if vid == native:  # native is already added untagged
                 continue
             lines.append(f'configure vlan "{vlan_names[vid]}" add ports {port} tagged')
@@ -262,7 +275,7 @@ def generate_exos_config(config: ParsedConfig) -> str:
         out.append(f"# Port-channel{po_id}")
         if po.description:
             out.append(f'configure ports {master} description-string "{po.description}"')
-        out.extend(_membership_lines(master, po, vlan_names))
+        out.extend(_membership_lines(master, po, vlan_names, warnings))
         if po.shutdown:
             out.append(f"disable ports {master}")
 
@@ -286,7 +299,7 @@ def generate_exos_config(config: ParsedConfig) -> str:
             continue
 
         port = port_map[name]
-        membership = _membership_lines(port, iface, vlan_names)
+        membership = _membership_lines(port, iface, vlan_names, warnings)
 
         # Skip ports with nothing to configure
         if not (iface.description or membership or iface.shutdown):
