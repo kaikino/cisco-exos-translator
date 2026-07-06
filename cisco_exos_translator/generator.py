@@ -163,7 +163,61 @@ def _lacp_for_modes(po_id: int, modes: set[str], warnings: list[str]) -> bool:
     return True
 
 
-def generate_exos_config(config: ParsedConfig) -> str:
+# Build a commented reference of the auto-derived names/ports so the user can
+# review them and edit the config below to customize
+def _translation_reference(
+    config: ParsedConfig, vlan_names: dict[int, str], port_map: dict[str, str]
+) -> list[str]:
+    lines = ["# Translation reference (auto-derived; edit the config below to customize)"]
+
+    # VLANs: Cisco tag -> EXOS name, flagging names we invented or changed
+    lines.append("# VLANs (Cisco tag -> EXOS name):")
+    for vid in sorted(vlan_names):
+        name = vlan_names[vid]
+        cisco = config.vlans[vid].name if vid in config.vlans else None
+        if vid == 1:
+            note = "  (built-in Default)"
+        elif not cisco:
+            note = "  (auto-named)"
+        elif name != _sanitize_vlan_name(cisco):
+            note = "  (renamed to avoid collision)"
+        elif name != cisco:
+            note = "  (sanitized)"
+        else:
+            note = ""
+        lines.append(f"#   {vid} -> {name}{note}")
+
+    # Ports: Cisco name -> EXOS port (skip routed, which are out of L2 scope)
+    port_items = [
+        (name, port_map[name])
+        for name in sorted(port_map)
+        if getattr(config.interfaces.get(name), "mode", None) != "routed"
+    ]
+    if port_items:
+        lines.append("# Ports (Cisco name -> EXOS port):")
+        for cisco_name, exos in port_items:
+            note = "  (uplink placeholder; replace)" if "{uplink" in exos else ""
+            lines.append(f"#   {cisco_name} -> {exos}{note}")
+
+    # LAG: Cisco Port-channel -> EXOS master port (bundles are keyed by master)
+    lag_items = [
+        (po_id, po) for po_id, po in sorted(config.port_channels.items()) if po.members
+    ]
+    if lag_items:
+        lines.append("# LAG (Cisco Port-channel -> EXOS master port):")
+        for po_id, po in lag_items:
+            members = [port_map[m] for m in sorted(po.members) if m in port_map]
+            if members:
+                lines.append(
+                    f"#   Port-channel{po_id} -> {members[0]}  (members: {', '.join(members)})"
+                )
+
+    lines.append("")
+    return lines
+
+
+def generate_exos_config(config: ParsedConfig) -> tuple[str, list[str]]:
+    # Returns the .xsf text and the list of translation warnings it raised
     warnings: list[str] = []
     out: list[str] = []
 
@@ -311,12 +365,22 @@ def generate_exos_config(config: ParsedConfig) -> str:
         if iface.shutdown:
             out.append(f"disable ports {port}")
 
-    # Prepend a warning banner so issues travel with the .xsf
-    if warnings:
-        banner = ["# GENERATION WARNINGS — review before deploying:"]
-        for w in warnings:
-            banner.append(f"#   - {w}")
+    # Prepend the translation reference, then the warning banner, so both travel
+    # with the .xsf (warnings first, then the reference, then the config)
+    out = _translation_reference(config, vlan_names, port_map) + out
+
+    # One banner for all warnings, grouped by source: input problems in the Cisco
+    # config vs decisions made translating to EXOS
+    input_warnings = config.warnings
+    if input_warnings or warnings:
+        banner = ["# WARNINGS — review before deploying"]
+        if input_warnings:
+            banner.append("# Input (problems in the Cisco config):")
+            banner.extend(f"#   - {w}" for w in input_warnings)
+        if warnings:
+            banner.append("# Translation (decisions made converting to EXOS):")
+            banner.extend(f"#   - {w}" for w in warnings)
         banner.append("")
         out = banner + out
 
-    return "\n".join(out) + "\n"
+    return "\n".join(out) + "\n", warnings

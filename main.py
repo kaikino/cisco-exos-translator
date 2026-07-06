@@ -80,16 +80,18 @@ def main(argv: list[str] | None = None) -> int:
 
     for path, config in sorted(configs.items()):
         # Generate the EXOS script and write it next to the input as <name>.xsf.
-        exos_text = generate_exos_config(config)
+        exos_text, gen_warnings = generate_exos_config(config)
         out_path = Path(path).with_suffix(".xsf")
         out_path.write_text(exos_text, encoding="utf-8")
         print(f"{path} -> {out_path}")
 
-        # Parser/validation warnings (generation warnings are embedded in the .xsf).
-        if config.warnings:
-            print("  Parse/validation warnings:", file=sys.stderr)
-            for w in config.warnings:
-                print(f"    - {w}", file=sys.stderr)
+        # All warnings are embedded in the .xsf header; just summarize here.
+        total = len(config.warnings) + len(gen_warnings)
+        if total:
+            print(
+                f"  {total} warning(s) — see the WARNINGS header in {out_path}",
+                file=sys.stderr,
+            )
 
     return 0
 
