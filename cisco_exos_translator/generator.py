@@ -58,8 +58,11 @@ def _build_vlan_name_map(config: ParsedConfig, warnings: list[str]) -> dict[int,
             referenced.add(iface.trunk_native_vlan)
 
     # Referenced-but-undefined VLANs are still created so the output is valid
+    # (tag 1 is excluded: it maps to the built-in Default, not an auto-created VLAN)
     defined = set(config.vlans.keys())
     for vid in sorted(referenced - defined):
+        if vid == 1:
+            continue
         warnings.append(
             f"VLAN {vid}: referenced by a port but never defined; "
             f"auto-creating it in the EXOS output"
@@ -68,6 +71,17 @@ def _build_vlan_name_map(config: ParsedConfig, warnings: list[str]) -> dict[int,
     name_map: dict[int, str] = {}
     used_names: set[str] = set()
     for vid in sorted(defined | referenced):
+        # Tag 1 is the EXOS built-in "Default" VLAN; reuse it, never recreate it
+        if vid == 1:
+            v = config.vlans.get(1)
+            if v and v.name and v.name.lower() != "default":
+                warnings.append(
+                    f"VLAN 1: Cisco name '{v.name}' ignored; EXOS uses the "
+                    f"built-in Default VLAN for tag 1"
+                )
+            name_map[1] = "Default"
+            used_names.add("Default")
+            continue
         raw = config.vlans[vid].name if vid in config.vlans and config.vlans[vid].name else None
         base = _sanitize_vlan_name(raw) if raw else f"VLAN_{vid}"
         # Suffix the tag if the base name is already taken
@@ -75,6 +89,18 @@ def _build_vlan_name_map(config: ParsedConfig, warnings: list[str]) -> dict[int,
         used_names.add(name)
         name_map[vid] = name
     return name_map
+
+
+# Add a port as an untagged member of a VLAN
+# EXOS ports start untagged in Default, so move them out first unless the target
+# is Default (tag 1) itself
+def _untagged_lines(port: str, vid: int, vlan_names: dict[int, str]) -> list[str]:
+    if vid == 1:
+        return [f"configure vlan Default add ports {port} untagged"]
+    return [
+        f"configure vlan Default delete ports {port}",
+        f'configure vlan "{vlan_names[vid]}" add ports {port} untagged',
+    ]
 
 
 # Render a port's switchport mode as EXOS "add ports" lines
@@ -94,15 +120,13 @@ def _membership_lines(
     if is_trunk:
         native = iface.trunk_native_vlan
         if native is not None:
-            lines.append(f'configure vlan "{vlan_names[native]}" add ports {port} untagged')
+            lines.extend(_untagged_lines(port, native, vlan_names))
         for vid in sorted(iface.trunk_allowed_vlans):
             if vid == native:  # native is already added untagged
                 continue
             lines.append(f'configure vlan "{vlan_names[vid]}" add ports {port} tagged')
     elif iface.access_vlan is not None:
-        lines.append(
-            f'configure vlan "{vlan_names[iface.access_vlan]}" add ports {port} untagged'
-        )
+        lines.extend(_untagged_lines(port, iface.access_vlan, vlan_names))
 
     return lines
 
@@ -184,6 +208,8 @@ def generate_exos_config(config: ParsedConfig) -> str:
     out.append("")
     out.append("# VLANs")
     for vid in sorted(vlan_names):
+        if vid == 1:
+            continue  # skip Default VLAN
         out.append(f'create vlan "{vlan_names[vid]}" tag {vid}')
 
     # Link aggregation
