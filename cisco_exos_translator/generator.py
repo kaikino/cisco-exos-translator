@@ -240,6 +240,46 @@ def _membership_lines(
     return lines
 
 
+# Summarize every Cisco line the parser could not translate (global and
+# per-interface), deduped by command text with counts and example line numbers
+def _unsupported_summary(config: ParsedConfig, max_unique: int = 40) -> list[str]:
+    items = list(config.unsupported_lines)
+    for iface in config.interfaces.values():
+        items.extend(iface.unsupported_lines)
+    if not items:
+        return []
+
+    counts: dict[str, int] = {}
+    examples: dict[str, list[int]] = {}
+    for u in items:
+        key = u.text.strip()
+        counts[key] = counts.get(key, 0) + 1
+        examples.setdefault(key, []).append(u.line_number)
+
+    lines = [
+        f"# Not translated ({len(items)} line(s) outside this tool's L2 scope; "
+        f"review for anything you must port manually):"
+    ]
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    for text, n in ranked[:max_unique]:
+        # a range block expands to many interfaces sharing one source line, so
+        # dedupe the example line numbers
+        uniq = sorted(set(examples[text]))
+        ex = ", ".join(str(x) for x in uniq[:3])
+        if n > 1:
+            more = ", ..." if len(uniq) > 3 else ""
+            lines.append(f"#   - '{text}' x{n} (lines {ex}{more})")
+        else:
+            lines.append(f"#   - '{text}' (line {ex})")
+    if len(ranked) > max_unique:
+        rest = sum(n for _, n in ranked[max_unique:])
+        lines.append(
+            f"#   ... and {len(ranked) - max_unique} more distinct commands "
+            f"({rest} line(s)) -- see the source config"
+        )
+    return lines
+
+
 # Commented reference of the active translation, prepended to the .xsf
 # the editable source of these values is the .map.json file
 def _translation_reference(
@@ -475,14 +515,16 @@ def generate_exos_config(
     # with the .xsf (warnings first, then the reference, then the config)
     out = _translation_reference(config, vlan_names, port_map, lag_map) + out
 
-    # One banner for all warnings, grouped by source: input problems in the Cisco
-    # config vs decisions made translating to EXOS
+    # One banner for all warnings, grouped by source: input problems in the
+    # Cisco config, lines dropped as untranslatable, and translation decisions
     input_warnings = config.warnings
-    if input_warnings or warnings:
+    unsupported = _unsupported_summary(config)
+    if input_warnings or unsupported or warnings:
         banner = ["# WARNINGS — review before deploying"]
         if input_warnings:
             banner.append("# Input (problems in the Cisco config):")
             banner.extend(f"#   - {w}" for w in input_warnings)
+        banner.extend(unsupported)
         if warnings:
             banner.append("# Translation (decisions made converting to EXOS):")
             banner.extend(f"#   - {w}" for w in warnings)

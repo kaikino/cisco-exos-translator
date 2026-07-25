@@ -104,9 +104,17 @@ def main(argv: list[str] | None = None) -> int:
 
         # All warnings are embedded in the .xsf header; just summarize here.
         total = len(config.warnings) + len(gen_warnings)
-        if total:
+        untranslated = len(config.unsupported_lines) + sum(
+            len(iface.unsupported_lines) for iface in config.interfaces.values()
+        )
+        if total or untranslated:
+            parts = []
+            if total:
+                parts.append(f"{total} warning(s)")
+            if untranslated:
+                parts.append(f"{untranslated} untranslated line(s)")
             print(
-                f"  {total} warning(s) — see the WARNINGS header in {out_path}",
+                f"  {' + '.join(parts)} — see the WARNINGS header in {out_path}",
                 file=sys.stderr,
             )
 
