@@ -13,12 +13,36 @@ in, one EXOS `.xsf` out. There is no multi-switch topology correlation.
 python3 main.py <cisco_config.cfg> [<cisco_config2.cfg> ...]
 ```
 
-For each input, writes `<name>.xsf` alongside it and prints a one-line warning
-count to stderr. All warnings are embedded as `#` comments in a `WARNINGS`
-header at the top of the `.xsf`, grouped into **Input** (problems in the Cisco
-config) and **Translation** (decisions made converting to EXOS). A
-`Translation reference` block below the header lists the auto-derived VLAN
-names, port mappings, and LAG master ports so they can be reviewed and edited.
+For each input, writes two files alongside it:
+
+- **`<name>.map.json`** — the translation mapping (VLAN names, Cisco→EXOS port
+  numbers, uplink rule, LAG master/mode). Written with derived defaults on the
+  first run and never overwritten after that. Edit it and re-run to customize
+  the translation. Your entries override the defaults; entries for interfaces
+  no longer in the config are ignored (warned), and new interfaces fall back
+  to derived defaults (warned). For uplink-module ports, set
+  `uplinks.start` to the target switch's first uplink port number (base
+  ports + 1, e.g. `49` on a 48-port switch) and every `{uplink-mN-pP}`
+  placeholder resolves to `start + P - 1` automatically; an explicit `ports`
+  entry still overrides the rule per-port.
+- **`<name>.xsf`** — the EXOS script, regenerated on every run from the config
+  plus the mapping.
+
+A one-line warning count goes to stderr. All warnings are embedded as `#`
+comments in a `WARNINGS` header at the top of the `.xsf`, grouped into
+**Input** (problems in the Cisco config), **Not translated** (every source
+line outside the tool's L2 scope — deduped by command with counts and line
+numbers, so nothing is dropped silently), and **Translation** (decisions made
+converting to EXOS, including unresolved mapping placeholders). A
+`Translation reference` block below the header shows the active mapping.
+
+Typical workflow:
+
+```bash
+python3 main.py sw1.cfg     # 1st run: writes sw1.map.json + sw1.xsf
+vi sw1.map.json             # resolve placeholders, rename VLANs, adjust LAGs
+python3 main.py sw1.cfg     # 2nd run: regenerates sw1.xsf with your edits
+```
 
 ## Pipeline
 
@@ -27,7 +51,8 @@ running-config text
   → scanner     (text  → structured blocks)
   → parser      (blocks → ParsedConfig IR)
   → validation  (cross-reference checks → warnings)
-  → generator   (ParsedConfig → EXOS .xsf)
+  → mapping     (derived defaults ⊕ user-edited <name>.map.json)
+  → generator   (ParsedConfig + mapping → EXOS .xsf)
 ```
 
 ## Supported translations
@@ -110,6 +135,7 @@ cisco_exos_translator/
   parser.py                     ConfigBlocks → ParsedConfig IR
   models.py                     dataclasses (Vlan, interfaces, ParsedConfig, ...)
   validation.py                 cross-reference checks (warnings)
-  generator.py                  ParsedConfig → EXOS .xsf
+  mapping.py                    .map.json read/write/merge
+  generator.py                  ParsedConfig + mapping → EXOS .xsf
   helpers.py                    VLAN list / interface name parsing
 ```
