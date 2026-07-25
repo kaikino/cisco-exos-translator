@@ -5,7 +5,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from cisco_exos_translator.generator import generate_exos_config
+from cisco_exos_translator.generator import build_default_mapping, generate_exos_config
+from cisco_exos_translator.mapping import load_mapping, merge_mapping, write_mapping
 from cisco_exos_translator.models import ParsedConfig
 from cisco_exos_translator.parser import (
     _infer_stack_members,
@@ -79,8 +80,24 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     for path, config in sorted(configs.items()):
+        # mapping: derived defaults overlaid with user edits from <name>.map.json
+        # first run writes the defaults for the user to edit
+        map_path = Path(path).with_suffix(".map.json")
+        defaults = build_default_mapping(config)
+        notes: list[str] = []
+        if map_path.exists():
+            try:
+                mapping, notes = merge_mapping(defaults, load_mapping(map_path))
+            except ValueError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+        else:
+            write_mapping(map_path, defaults)
+            print(f"{map_path} written — edit it to customize, then re-run")
+            mapping = defaults
+
         # Generate the EXOS script and write it next to the input as <name>.xsf.
-        exos_text, gen_warnings = generate_exos_config(config)
+        exos_text, gen_warnings = generate_exos_config(config, mapping, notes)
         out_path = Path(path).with_suffix(".xsf")
         out_path.write_text(exos_text, encoding="utf-8")
         print(f"{path} -> {out_path}")

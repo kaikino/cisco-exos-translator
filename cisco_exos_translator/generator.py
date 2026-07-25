@@ -1,4 +1,6 @@
 # generator pass to render EXOS config (.xsf) from a ParsedConfig
+# translation decisions (vlan names, port numbers, lag master/mode) come from a
+# mapping dict: derived defaults the user can override via <name>.map.json
 
 from __future__ import annotations
 
@@ -10,30 +12,20 @@ from .models import ParsedConfig, PhysicalInterface
 # Translate a Cisco <member>/<module>/<port> name to an EXOS port string
 # EXOS uses "<slot>:<port>" on a stack or bare "<port>" standalone; only module 0
 # maps cleanly, so a non-zero (uplink) module becomes a placeholder to replace
-def _exos_port(iface: PhysicalInterface, stacked: bool, warnings: list[str]) -> str:
+def _exos_port(iface: PhysicalInterface, stacked: bool) -> str:
     slot = iface.stack_member
     module = iface.module
     port = iface.port
 
-    # No numbering parsed: emit the name verbatim for manual correction
+    # no numbering parsed: emit the name verbatim for manual correction
     if slot is None or port is None:
-        warnings.append(
-            f"{iface.canonical_name}: could not derive an EXOS port number; "
-            f"emitted the name verbatim for manual correction"
-        )
         return iface.canonical_name
 
-    # Uplink/expansion module: EXOS port number is platform-specific and unknown,
+    # uplink/expansion module: EXOS port number is platform-specific and unknown,
     # so emit a distinct, invalid placeholder carrying the Cisco module/port
     if module not in (0, None):
         placeholder = f"{{uplink-m{module}-p{port}}}"
-        token = f"{slot}:{placeholder}" if stacked else placeholder
-        warnings.append(
-            f"{iface.canonical_name}: uplink/expansion module {module} has no "
-            f"fixed EXOS port number; emitted placeholder '{token}' -- replace "
-            f"it with the real port from the target platform's port map"
-        )
-        return token
+        return f"{slot}:{placeholder}" if stacked else placeholder
 
     return f"{slot}:{port}" if stacked else str(port)
 
@@ -91,6 +83,81 @@ def _build_vlan_name_map(config: ParsedConfig, warnings: list[str]) -> dict[int,
     return name_map
 
 
+# Decide whether a bundle defaults to LACP (True) or static (False)
+# active/passive -> LACP, on -> static, auto/desirable -> PAgP (flagged, LACP)
+def _lacp_for_modes(po_id: int, modes: set[str], warnings: list[str]) -> bool:
+    if modes & {"auto", "desirable"}:
+        warnings.append(
+            f"Port-channel{po_id}: PAgP mode(s) {sorted(modes & {'auto', 'desirable'})} "
+            f"have no EXOS equivalent; defaulting to LACP (override via the mapping file)"
+        )
+        return True
+    if modes == {"on"}:
+        return False  # static bundle
+    if "on" in modes and modes & {"active", "passive"}:
+        warnings.append(
+            f"Port-channel{po_id}: mixed static ('on') and LACP member modes; "
+            f"defaulting to LACP"
+        )
+    return True
+
+
+# collect channel modes of a bundle's member ports
+def _member_modes(config: ParsedConfig, po) -> set[str]:
+    return {
+        config.interfaces[m].channel_mode
+        for m in po.members
+        if isinstance(config.interfaces.get(m), PhysicalInterface)
+        and config.interfaces[m].channel_mode
+    }
+
+
+# build the default translation mapping: every decision the user may override
+def build_default_mapping(config: ParsedConfig) -> dict:
+    stacked = len(config.stack_members) > 1
+    throwaway: list[str] = []  # warnings re-raised at generation time
+
+    vlans = {
+        str(vid): name
+        for vid, name in _build_vlan_name_map(config, throwaway).items()
+    }
+
+    ports: dict[str, str] = {}
+    for name, iface in sorted(config.interfaces.items()):
+        if isinstance(iface, PhysicalInterface):
+            ports[name] = _exos_port(iface, stacked)
+
+    lags: dict[str, dict] = {}
+    for po_id, po in sorted(config.port_channels.items()):
+        if not po.members:
+            continue
+        member_ports = [ports[m] for m in sorted(po.members) if m in ports]
+        if not member_ports:
+            continue
+        lacp = _lacp_for_modes(po_id, _member_modes(config, po), throwaway)
+        lags[f"Port-channel{po_id}"] = {
+            "master": member_ports[0],
+            "mode": "lacp" if lacp else "static",
+        }
+
+    return {
+        "_help": [
+            "Translation mapping: derived defaults from the Cisco config.",
+            "Edit values and re-run the translator; your edits win over defaults.",
+            "vlans: Cisco tag -> EXOS VLAN name (tag 1 is the built-in Default).",
+            "ports: Cisco interface -> EXOS port; replace {uplink-mN-pP} tokens",
+            "       with the real port from the target platform's port map.",
+            "lags: master must be one of the LAG's member ports; mode is",
+            "      'lacp' or 'static'.",
+            "Entries for interfaces no longer in the Cisco config are ignored;",
+            "new interfaces get derived defaults until added here.",
+        ],
+        "vlans": vlans,
+        "ports": ports,
+        "lags": lags,
+    }
+
+
 # Add a port as an untagged member of a VLAN
 # EXOS ports start untagged in Default, so move them out first unless the target
 # is Default (tag 1) itself
@@ -144,31 +211,13 @@ def _membership_lines(
     return lines
 
 
-# Decide whether a bundle emits the "lacp" keyword (dynamic) or is static
-# active/passive -> LACP, on -> static, auto/desirable -> PAgP (flagged, LACP)
-def _lacp_for_modes(po_id: int, modes: set[str], warnings: list[str]) -> bool:
-    if modes & {"auto", "desirable"}:
-        warnings.append(
-            f"Port-channel{po_id}: PAgP mode(s) {sorted(modes & {'auto', 'desirable'})} "
-            f"have no EXOS equivalent; emitting LACP as the closest match"
-        )
-        return True
-    if modes == {"on"}:
-        return False  # static bundle
-    if "on" in modes and modes & {"active", "passive"}:
-        warnings.append(
-            f"Port-channel{po_id}: mixed static ('on') and LACP member modes; "
-            f"emitting LACP"
-        )
-    return True
-
-
-# Build a commented reference of the auto-derived names/ports so the user can
-# review them and edit the config below to customize
+# Commented reference of the active translation, prepended to the .xsf
+# the editable source of these values is the .map.json file
 def _translation_reference(
-    config: ParsedConfig, vlan_names: dict[int, str], port_map: dict[str, str]
+    config: ParsedConfig, vlan_names: dict[int, str], port_map: dict[str, str],
+    lag_map: dict[int, tuple[str, list[str], bool]],
 ) -> list[str]:
-    lines = ["# Translation reference (auto-derived; edit the config below to customize)"]
+    lines = ["# Translation reference (from the mapping file; edit it and re-run to change)"]
 
     # VLANs: Cisco tag -> EXOS name, flagging names we invented or changed
     lines.append("# VLANs (Cisco tag -> EXOS name):")
@@ -179,10 +228,8 @@ def _translation_reference(
             note = "  (built-in Default)"
         elif not cisco:
             note = "  (auto-named)"
-        elif name != _sanitize_vlan_name(cisco):
-            note = "  (renamed to avoid collision)"
         elif name != cisco:
-            note = "  (sanitized)"
+            note = "  (was '" + cisco + "')"
         else:
             note = ""
         lines.append(f"#   {vid} -> {name}{note}")
@@ -200,48 +247,99 @@ def _translation_reference(
             lines.append(f"#   {cisco_name} -> {exos}{note}")
 
     # LAG: Cisco Port-channel -> EXOS master port (bundles are keyed by master)
-    lag_items = [
-        (po_id, po) for po_id, po in sorted(config.port_channels.items()) if po.members
-    ]
-    if lag_items:
+    if lag_map:
         lines.append("# LAG (Cisco Port-channel -> EXOS master port):")
-        for po_id, po in lag_items:
-            members = [port_map[m] for m in sorted(po.members) if m in port_map]
-            if members:
-                lines.append(
-                    f"#   Port-channel{po_id} -> {members[0]}  (members: {', '.join(members)})"
-                )
+        for po_id, (master, members, lacp) in sorted(lag_map.items()):
+            mode = "lacp" if lacp else "static"
+            lines.append(
+                f"#   Port-channel{po_id} -> {master}  "
+                f"(members: {', '.join(members)}; {mode})"
+            )
 
     lines.append("")
     return lines
 
 
-def generate_exos_config(config: ParsedConfig) -> tuple[str, list[str]]:
+def generate_exos_config(
+    config: ParsedConfig,
+    mapping: dict | None = None,
+    mapping_notes: list[str] | None = None,
+) -> tuple[str, list[str]]:
     # Returns the .xsf text and the list of translation warnings it raised
-    warnings: list[str] = []
+    warnings: list[str] = list(mapping_notes or [])
     out: list[str] = []
 
-    # A multi-member stack uses "slot:port"; a single switch uses bare "port"
-    stacked = len(config.stack_members) > 1
+    if mapping is None:
+        mapping = build_default_mapping(config)
 
-    # Resolve every physical port to its EXOS name once, then flag any distinct
-    # Cisco ports that still collapse to the same EXOS port
-    port_map: dict[str, str] = {}
+    # vlan names: rebuild defaults for their warnings, then mapping values win
+    vlan_names = _build_vlan_name_map(config, warnings)
+    for key, name in (mapping.get("vlans") or {}).items():
+        try:
+            vid = int(key)
+        except ValueError:
+            warnings.append(f"mapping: VLAN key '{key}' is not a number; ignored")
+            continue
+        if vid in vlan_names:
+            vlan_names[vid] = name
+
+    # port names come from the mapping; validate what the user left in place
+    port_map: dict[str, str] = dict(mapping.get("ports") or {})
     collisions: dict[str, list[str]] = {}
-    for name, iface in sorted(config.interfaces.items()):
-        if isinstance(iface, PhysicalInterface):
-            exos = _exos_port(iface, stacked, warnings)
-            port_map[name] = exos
-            collisions.setdefault(exos, []).append(name)
+    for name, exos in sorted(port_map.items()):
+        iface = config.interfaces.get(name)
+        if getattr(iface, "mode", None) == "routed":
+            continue  # excluded from output anyway
+        if "{uplink" in exos:
+            warnings.append(
+                f"{name}: unresolved uplink placeholder '{exos}'; replace it "
+                f"with the real port in the mapping file"
+            )
+        elif exos == name:
+            warnings.append(
+                f"{name}: could not derive an EXOS port number; emitted the "
+                f"name verbatim -- correct it in the mapping file"
+            )
+        collisions.setdefault(exos, []).append(name)
     for exos, sources in sorted(collisions.items()):
         if len(sources) > 1:
             warnings.append(
                 f"EXOS port '{exos}' is the target of multiple Cisco interfaces "
                 f"({', '.join(sources)}); their config is merged and almost "
-                f"certainly wrong -- assign distinct ports manually"
+                f"certainly wrong -- assign distinct ports in the mapping file"
             )
 
-    vlan_names = _build_vlan_name_map(config, warnings)
+    # resolve each LAG once: master (mapping wins), member ports, lacp/static
+    lag_settings = mapping.get("lags") or {}
+    lag_map: dict[int, tuple[str, list[str], bool]] = {}
+    for po_id, po in sorted(config.port_channels.items()):
+        if not po.members:
+            warnings.append(
+                f"Port-channel{po_id}: no member ports; skipped in EXOS output"
+            )
+            continue
+        member_ports = [port_map[m] for m in sorted(po.members) if m in port_map]
+        if not member_ports:
+            continue
+        default_lacp = _lacp_for_modes(po_id, _member_modes(config, po), warnings)
+
+        entry = lag_settings.get(f"Port-channel{po_id}") or {}
+        master = entry.get("master") or member_ports[0]
+        if master not in member_ports:
+            warnings.append(
+                f"Port-channel{po_id}: mapping master '{master}' is not one of "
+                f"the member ports; using '{member_ports[0]}'"
+            )
+            master = member_ports[0]
+        mode = entry.get("mode")
+        if mode not in (None, "lacp", "static"):
+            warnings.append(
+                f"Port-channel{po_id}: mapping mode '{mode}' is not "
+                f"'lacp'/'static'; using the derived default"
+            )
+            mode = None
+        lacp = default_lacp if mode is None else (mode == "lacp")
+        lag_map[po_id] = (master, member_ports, lacp)
 
     # Bundle members get their L2 config from the LAG master, not individually
     bundled: set[str] = set()
@@ -280,33 +378,12 @@ def generate_exos_config(config: ParsedConfig) -> tuple[str, list[str]]:
         out.append(f'create vlan "{vlan_names[vid]}" tag {vid}')
 
     # Link aggregation
-    if config.port_channels:
+    if lag_map:
         out.append("")
         out.append("# Link aggregation (sharing)")
-        for po_id, po in sorted(config.port_channels.items()):
-            if not po.members:
-                warnings.append(
-                    f"Port-channel{po_id}: no member ports; skipped in EXOS output"
-                )
-                continue
-
-            # Resolve members to EXOS ports; the lowest is the master
-            member_ports: list[str] = []
-            modes: set[str] = set()
-            for canonical in sorted(po.members):
-                iface = config.interfaces.get(canonical)
-                if not isinstance(iface, PhysicalInterface):
-                    continue
-                member_ports.append(port_map[canonical])
-                if iface.channel_mode:
-                    modes.add(iface.channel_mode)
-
-            if not member_ports:
-                continue
-
-            master = member_ports[0]
+        for po_id, (master, member_ports, lacp) in sorted(lag_map.items()):
             grouping = ",".join(member_ports)
-            suffix = " lacp" if _lacp_for_modes(po_id, modes, warnings) else ""
+            suffix = " lacp" if lacp else ""
             out.append(
                 f"enable sharing {master} grouping {grouping} "
                 f"algorithm address-based L3_L4{suffix}"
@@ -317,14 +394,8 @@ def generate_exos_config(config: ParsedConfig) -> tuple[str, list[str]]:
     out.append("# Port configuration")
 
     # Bundle L2 config applies to the LAG master port
-    for po_id, po in sorted(config.port_channels.items()):
-        if not po.members:
-            continue
-        master_name = sorted(po.members)[0]
-        master_iface = config.interfaces.get(master_name)
-        if not isinstance(master_iface, PhysicalInterface):
-            continue
-        master = port_map[master_name]
+    for po_id, (master, member_ports, _lacp) in sorted(lag_map.items()):
+        po = config.port_channels[po_id]
 
         out.append(f"# Port-channel{po_id}")
         if po.description:
@@ -351,6 +422,9 @@ def generate_exos_config(config: ParsedConfig) -> tuple[str, list[str]]:
             )
             out.append(f"# {name}: routed interface skipped (L3, out of scope)")
             continue
+        if name not in port_map:
+            warnings.append(f"{name}: no port mapping entry; skipped")
+            continue
 
         port = port_map[name]
         membership = _membership_lines(port, iface, vlan_names, warnings)
@@ -367,7 +441,7 @@ def generate_exos_config(config: ParsedConfig) -> tuple[str, list[str]]:
 
     # Prepend the translation reference, then the warning banner, so both travel
     # with the .xsf (warnings first, then the reference, then the config)
-    out = _translation_reference(config, vlan_names, port_map) + out
+    out = _translation_reference(config, vlan_names, port_map, lag_map) + out
 
     # One banner for all warnings, grouped by source: input problems in the Cisco
     # config vs decisions made translating to EXOS
