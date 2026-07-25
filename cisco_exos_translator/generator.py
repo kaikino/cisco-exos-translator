@@ -9,6 +9,12 @@ import re
 from .models import ParsedConfig, PhysicalInterface
 
 
+# SVIs ("interface Vlan10") are logical L3 interfaces, not ports; excluded from
+# port translation even when they carry no ip address line
+def _is_svi(iface: PhysicalInterface) -> bool:
+    return iface.interface_type.lower() == "vlan"
+
+
 # Translate a Cisco <member>/<module>/<port> name to an EXOS port string
 # EXOS uses "<slot>:<port>" on a stack or bare "<port>" standalone; only module 0
 # maps cleanly, so a non-zero (uplink) module becomes a placeholder to replace
@@ -148,7 +154,7 @@ def build_default_mapping(config: ParsedConfig) -> dict:
 
     ports: dict[str, str] = {}
     for name, iface in sorted(config.interfaces.items()):
-        if isinstance(iface, PhysicalInterface):
+        if isinstance(iface, PhysicalInterface) and not _is_svi(iface):
             ports[name] = _exos_port(iface, stacked)
 
     lags: dict[str, dict] = {}
@@ -482,11 +488,17 @@ def generate_exos_config(
             if isinstance(m_iface, PhysicalInterface) and m_iface.shutdown:
                 out.append(f"disable ports {port_map[canonical]}")
 
-    # Standalone physical ports (not bundled, not routed)
+    # Standalone physical ports (not bundled, not routed, not SVIs)
     for name, iface in sorted(config.interfaces.items()):
         if not isinstance(iface, PhysicalInterface):
             continue
         if name in bundled:
+            continue
+        if _is_svi(iface):
+            warnings.append(
+                f"{name}: SVI (logical L3 interface) is out of L2 scope; skipped"
+            )
+            out.append(f"# {name}: SVI skipped (L3, out of scope)")
             continue
         if iface.mode == "routed":
             warnings.append(
