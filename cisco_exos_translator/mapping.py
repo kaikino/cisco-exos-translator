@@ -36,6 +36,12 @@ def merge_mapping(defaults: dict, user: dict) -> tuple[dict, list[str]]:
         for key, value in defaults.items()
     }
 
+    # uplinks is a small settings object, not a per-item map: user values win
+    # wholesale, no per-key notes
+    user_uplinks = user.get("uplinks")
+    if isinstance(user_uplinks, dict):
+        merged.setdefault("uplinks", {}).update(user_uplinks)
+
     for section in _SECTIONS:
         user_section = user.get(section, {})
         if not isinstance(user_section, dict):

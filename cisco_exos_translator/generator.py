@@ -30,6 +30,30 @@ def _exos_port(iface: PhysicalInterface, stacked: bool) -> str:
     return f"{slot}:{port}" if stacked else str(port)
 
 
+# placeholder emitted for uplink-module ports, e.g. "{uplink-m1-p2}"
+RE_UPLINK = re.compile(r"\{uplink-m(\d+)-p(\d+)\}")
+
+
+# resolve uplink placeholders via the mapping's uplink rule: EXOS uplinks are
+# numbered right after the base ports, so module port P -> start + P - 1
+# explicit per-port edits already replaced their placeholder and are unaffected
+def _resolve_uplinks(
+    port_map: dict[str, str], uplinks: dict | None, warnings: list[str]
+) -> None:
+    start = (uplinks or {}).get("start")
+    if start is None:
+        return
+    if not isinstance(start, int) or start < 1:
+        warnings.append(
+            f"mapping: uplinks.start '{start}' is not a positive integer; ignored"
+        )
+        return
+    for name, exos in port_map.items():
+        m = RE_UPLINK.search(exos)
+        if m:
+            port_map[name] = RE_UPLINK.sub(str(start + int(m.group(2)) - 1), exos)
+
+
 # Sanitize a Cisco VLAN name to EXOS rules: starts with a letter, alnum/_, <=32
 def _sanitize_vlan_name(name: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_]", "_", name)
@@ -145,8 +169,12 @@ def build_default_mapping(config: ParsedConfig) -> dict:
             "Translation mapping: derived defaults from the Cisco config.",
             "Edit values and re-run the translator; your edits win over defaults.",
             "vlans: Cisco tag -> EXOS VLAN name (tag 1 is the built-in Default).",
-            "ports: Cisco interface -> EXOS port; replace {uplink-mN-pP} tokens",
-            "       with the real port from the target platform's port map.",
+            "ports: Cisco interface -> EXOS port; {uplink-mN-pP} tokens are",
+            "       unresolved uplink-module ports (see uplinks below), or",
+            "       replace them here individually.",
+            "uplinks: set start to the target switch's first uplink port number",
+            "       (base ports + 1, e.g. 49 on a 48-port switch); every",
+            "       {uplink-mN-pP} then resolves to start + P - 1 automatically.",
             "lags: master must be one of the LAG's member ports; mode is",
             "      'lacp' or 'static'.",
             "Entries for interfaces no longer in the Cisco config are ignored;",
@@ -154,6 +182,7 @@ def build_default_mapping(config: ParsedConfig) -> dict:
         ],
         "vlans": vlans,
         "ports": ports,
+        "uplinks": {"start": None},
         "lags": lags,
     }
 
@@ -283,8 +312,10 @@ def generate_exos_config(
         if vid in vlan_names:
             vlan_names[vid] = name
 
-    # port names come from the mapping; validate what the user left in place
+    # port names come from the mapping; resolve uplink placeholders through the
+    # uplink rule, then validate what is left in place
     port_map: dict[str, str] = dict(mapping.get("ports") or {})
+    _resolve_uplinks(port_map, mapping.get("uplinks"), warnings)
     collisions: dict[str, list[str]] = {}
     for name, exos in sorted(port_map.items()):
         iface = config.interfaces.get(name)
@@ -292,8 +323,9 @@ def generate_exos_config(
             continue  # excluded from output anyway
         if "{uplink" in exos:
             warnings.append(
-                f"{name}: unresolved uplink placeholder '{exos}'; replace it "
-                f"with the real port in the mapping file"
+                f"{name}: unresolved uplink placeholder '{exos}'; set "
+                f"uplinks.start in the mapping file (first uplink port number) "
+                f"or replace this port entry individually"
             )
         elif exos == name:
             warnings.append(
