@@ -544,3 +544,70 @@ def generate_exos_config(
         out = banner + out
 
     return "\n".join(out) + "\n", warnings
+
+
+# Stack bring-up runbook for configs with 2+ stack members
+# EXOS stacking is a mode change with per-node reboots and a fresh config
+# context, so it cannot live in the .xsf; this emits the ordered steps instead.
+# Returns None for standalone configs
+def generate_stack_setup(config: ParsedConfig, xsf_name: str) -> str | None:
+    members = config.stack_members
+    if len(members) < 2:
+        return None
+
+    out: list[str] = []
+    host = config.hostname or "the stack"
+    out.append(f"# Stack bring-up runbook for {host} -- run BEFORE loading {xsf_name}")
+    out.append(f"# Derived from the Cisco config: {len(members)} stack members")
+    for mid, m in sorted(members.items()):
+        model = m.provision_model or "model not in config"
+        prio = f", priority {m.priority}" if m.priority is not None else ""
+        out.append(f"#   Cisco switch {mid}: {model}{prio}")
+    out.append("#")
+    out.append("# Stacking is a mode change (reboots, fresh config context), so these")
+    out.append("# steps cannot be part of the .xsf. Follow them in order.")
+    out.append("")
+
+    out.append("# Phase 0 -- prerequisites: same EXOS version on all nodes (show version),")
+    out.append("# stack cables connected (ring recommended)")
+    out.append("")
+
+    out.append("# Phase 1 -- on EACH switch individually (console or per-switch mgmt);")
+    out.append("# turns the stack ports on (they stop being data ports)")
+    out.append("show stacking-support  # already Enabled on every node? skip to Phase 2")
+    out.append("enable stacking-support")
+    out.append("save configuration")
+    out.append("reboot")
+    out.append("")
+
+    out.append("# Phase 2 -- after all nodes are back, ONLY on the switch that was")
+    out.append("# Cisco member 1 (slot numbers must match the Cisco member numbers so")
+    out.append("# the slot:port config in the .xsf lands on the right ports)")
+    out.append(f"show stacking          # expect {len(members)} nodes, topology Ring")
+    out.append("enable stacking        # accept Easy Setup; this node becomes slot 1;")
+    out.append("                       # easy setup reboots the whole stack itself")
+    out.append("# if Easy Setup is NOT offered (parameters kept from an earlier stack):")
+    out.append("# show stacking configuration   -> 'e' flag on every node, slots correct")
+    out.append("# reboot stack-topology         -> plain reboot restarts this node only")
+    out.append("")
+
+    out.append("# Phase 3 -- after the stack reboot, on the slot-1 console")
+    out.append("# NOTE: stacking mode boots a fresh config context -- re-establish any")
+    out.append("# management access (mgmt IP etc.) your way before continuing remotely")
+    priolines = [
+        f"configure stacking slot {mid} priority {m.priority}"
+        for mid, m in sorted(members.items())
+        if m.priority is not None
+    ]
+    if priolines:
+        out.append("# master-election priorities from the Cisco config (higher wins on both)")
+        out.extend(priolines)
+    out.append("save configuration")
+    out.append("")
+
+    out.append("# Phase 4 -- verify, then load the translated config")
+    out.append("show stacking          # all nodes Active, slot 1 Master")
+    out.append("show slot              # all slots Operational")
+    out.append(f"load script {xsf_name}")
+    out.append("save configuration")
+    return "\n".join(out) + "\n"

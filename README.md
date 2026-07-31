@@ -27,6 +27,14 @@ For each input, writes two files alongside it:
   entry still overrides the rule per-port.
 - **`<name>.xsf`** — the EXOS script, regenerated on every run from the config
   plus the mapping.
+- **`<name>.stack-setup.txt`** (only when the source config has 2+ stack
+  members) — the stack bring-up runbook. EXOS stacking is a mode change with
+  per-node reboots and a fresh config context, so it cannot be part of the
+  `.xsf`; this file lists the ordered steps (per-node `enable stacking-support`,
+  Easy Setup from the member-1 switch, slot priorities carried over from
+  `switch N priority`, plus a warning that stacking boots a fresh config
+  context) to run **before** loading the `.xsf`. Environment-specific work
+  such as re-establishing management access is noted but left to the operator.
 
 A one-line warning count goes to stderr. All warnings are embedded as `#`
 comments in a `WARNINGS` header at the top of the `.xsf`, grouped into
@@ -117,8 +125,10 @@ Embedded as `#` comments at the top of each `.xsf`:
 
 - **Layer 3**: `ip address` is only used to flag a port as routed (the address
   is not captured); `ip route`, SVIs, and `ip forwarding` are not translated.
-- **Stack provisioning / priority** — informational comments only; EXOS
-  stacking is configured on-hardware.
+- **Stack provisioning** — the Cisco SKU cannot be mapped to an EXOS slot type
+  (comments only). Member count and priorities do translate: they drive the
+  generated `.stack-setup.txt` runbook, but stack formation itself is a manual,
+  reboot-bound procedure.
 - **Uplink-module port renumbering** — requires the target platform's port map;
   emitted as a `{uplink-mN-pM}` placeholder for manual replacement.
 - STP/spanning-tree, port speed/duplex, PoE, ACLs, QoS, storm-control, voice

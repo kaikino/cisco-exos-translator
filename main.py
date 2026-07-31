@@ -5,7 +5,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from cisco_exos_translator.generator import build_default_mapping, generate_exos_config
+from cisco_exos_translator.generator import (
+    build_default_mapping,
+    generate_exos_config,
+    generate_stack_setup,
+)
 from cisco_exos_translator.mapping import load_mapping, merge_mapping, write_mapping
 from cisco_exos_translator.models import ParsedConfig
 from cisco_exos_translator.parser import (
@@ -101,6 +105,14 @@ def main(argv: list[str] | None = None) -> int:
         out_path = Path(path).with_suffix(".xsf")
         out_path.write_text(exos_text, encoding="utf-8")
         print(f"{path} -> {out_path}")
+
+        # Stacked source: also emit the stack bring-up runbook (the .xsf must be
+        # loaded only after the stack exists).
+        setup_text = generate_stack_setup(config, out_path.name)
+        if setup_text:
+            setup_path = Path(path).with_suffix(".stack-setup.txt")
+            setup_path.write_text(setup_text, encoding="utf-8")
+            print(f"{path} -> {setup_path} (run before loading the .xsf)")
 
         # All warnings are embedded in the .xsf header; just summarize here.
         total = len(config.warnings) + len(gen_warnings)
