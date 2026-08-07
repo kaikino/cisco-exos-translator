@@ -246,6 +246,53 @@ def _membership_lines(
     return lines
 
 
+# Render one Cisco ACL as an EXOS policy file (.pol): ordered entries, remarks
+# preserved as # comments, plus a trailing deny-all (Cisco's implicit deny;
+# EXOS permits unmatched traffic by default)
+def _acl_policy(acl_name: str, rules) -> str:
+    lines = [f"# translated from Cisco ACL {acl_name}"]
+    n = 0
+    for r in rules:
+        if r.action == "remark":
+            lines.append(f"# {r.remark}")
+            continue
+        n += 10
+        conds = []
+        if r.protocol:
+            conds.append(f"protocol {r.protocol}")
+        if r.source:
+            conds.append(f"source-address {r.source}")
+        if r.source_port:
+            lo, hi = r.source_port
+            conds.append(f"source-port {lo}" if lo == hi else f"source-port {lo} - {hi}")
+        if r.destination:
+            conds.append(f"destination-address {r.destination}")
+        if r.destination_port:
+            lo, hi = r.destination_port
+            conds.append(
+                f"destination-port {lo}" if lo == hi else f"destination-port {lo} - {hi}"
+            )
+        lines.append(f"entry r{n} {{")
+        lines.append("    if {")
+        for c in conds:
+            lines.append(f"        {c};")
+        lines.append("    } then {")
+        lines.append(f"        {r.action};")
+        lines.append("    }")
+        lines.append("}")
+    # match all IPv4 (not an empty match): Cisco's implicit deny applies to IP
+    # traffic only -- an unconditional deny here would also drop ARP etc.
+    lines.append("# Cisco implicit deny (IPv4 only)")
+    lines.append("entry implicit_deny {")
+    lines.append("    if {")
+    lines.append("        source-address 0.0.0.0/0;")
+    lines.append("    } then {")
+    lines.append("        deny;")
+    lines.append("    }")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
 # Summarize every Cisco line the parser could not translate (global and
 # per-interface), deduped by command text with counts and example line numbers
 def _unsupported_summary(config: ParsedConfig, max_unique: int = 40) -> list[str]:
@@ -339,8 +386,10 @@ def generate_exos_config(
     config: ParsedConfig,
     mapping: dict | None = None,
     mapping_notes: list[str] | None = None,
-) -> tuple[str, list[str]]:
-    # Returns the .xsf text and the list of translation warnings it raised
+) -> tuple[str, list[str], dict[str, str]]:
+    # Returns the .xsf text, the translation warnings, and the ACL policy
+    # files as {policy_name: .pol content} (empty when the config has no
+    # applied ACLs)
     warnings: list[str] = list(mapping_notes or [])
     out: list[str] = []
 
@@ -523,6 +572,58 @@ def generate_exos_config(
         if iface.shutdown:
             out.append(f"disable ports {port}")
 
+    # ACLs: Cisco ACLs referenced by "ip access-group <name> in" become EXOS
+    # policy files (.pol, emitted as separate outputs) applied ingress; the
+    # .pol files must be on the switch before this script is loaded
+    applied: dict[str, list[str]] = {}  # acl name -> EXOS ports using it
+    for name, iface in sorted(config.interfaces.items()):
+        acl = iface.access_group_in
+        if not acl:
+            continue
+        if isinstance(iface, PhysicalInterface):
+            if _is_svi(iface) or iface.mode == "routed":
+                # a router ACL (RACL) filtering routed traffic; meaningful only
+                # once L3 (SVI/VLAN addressing) is translated
+                warnings.append(
+                    f"{name}: ACL {acl} is applied on an SVI/routed interface "
+                    f"(router ACL); not translated -- requires L3 support"
+                )
+                continue
+            if name in bundled:
+                continue
+            if name in port_map:
+                applied.setdefault(acl, []).append(port_map[name])
+        else:  # bundle: ACL applies on the LAG master port
+            po_id = next(
+                (pid for pid, po in config.port_channels.items()
+                 if po.canonical_name == name), None
+            )
+            if po_id in lag_map:
+                applied.setdefault(acl, []).append(lag_map[po_id][0])
+
+    for acl in sorted(set(config.acls) - set(applied)):
+        warnings.append(
+            f"ACL {acl}: defined but not applied to any translated port; skipped"
+        )
+    pol_files: dict[str, str] = {}  # policy name -> .pol file content
+    if applied:
+        out.append("")
+        out.append("# ACLs (policy files; upload each <name>.pol to the switch")
+        out.append("# BEFORE loading this script)")
+    for acl, ports in sorted(applied.items()):
+        rules = config.acls.get(acl)
+        if not rules:
+            warnings.append(
+                f"ACL {acl}: referenced by 'ip access-group' but never defined; "
+                f"not applied"
+            )
+            continue
+        # policy name must equal the .pol basename; reuse the VLAN name rules
+        base = _sanitize_vlan_name(acl)
+        pol_files[base] = _acl_policy(acl, rules)
+        for port in sorted(set(ports)):
+            out.append(f"configure access-list {base} ports {port} ingress")
+
     # Prepend the translation reference, then the warning banner, so both travel
     # with the .xsf (warnings first, then the reference, then the config)
     out = _translation_reference(config, vlan_names, port_map, lag_map) + out
@@ -543,7 +644,7 @@ def generate_exos_config(
         banner.append("")
         out = banner + out
 
-    return "\n".join(out) + "\n", warnings
+    return "\n".join(out) + "\n", warnings, pol_files
 
 
 # Stack bring-up runbook for configs with 2+ stack members

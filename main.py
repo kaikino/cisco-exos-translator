@@ -15,6 +15,7 @@ from cisco_exos_translator.models import ParsedConfig
 from cisco_exos_translator.parser import (
     _infer_stack_members,
     _link_port_channel_members,
+    _parse_acl_block,
     _parse_global_block,
     _parse_interface_block,
     _parse_vlan_block,
@@ -38,6 +39,8 @@ def parse_cisco_config(text: str) -> ParsedConfig:
             _parse_global_block(config, block)
         elif block.kind == "vlan":
             _parse_vlan_block(config, block)
+        elif block.kind == "acl":
+            _parse_acl_block(config, block)
         elif block.kind == "interface":
             _parse_interface_block(config, block, is_range=False, explicit_allowed=explicit_allowed)
         elif block.kind == "interface_range":
@@ -101,10 +104,22 @@ def main(argv: list[str] | None = None) -> int:
             mapping = defaults
 
         # Generate the EXOS script and write it next to the input as <name>.xsf.
-        exos_text, gen_warnings = generate_exos_config(config, mapping, notes)
+        exos_text, gen_warnings, pol_files = generate_exos_config(config, mapping, notes)
         out_path = Path(path).with_suffix(".xsf")
         out_path.write_text(exos_text, encoding="utf-8")
         print(f"{path} -> {out_path}")
+
+        # ACL policy files go in <name>-acls/; the basename must stay equal to
+        # the policy name the .xsf references, so they get their own directory.
+        if pol_files:
+            acl_dir = Path(f"{Path(path).with_suffix('')}-acls")
+            acl_dir.mkdir(exist_ok=True)
+            for pol_name, text in sorted(pol_files.items()):
+                (acl_dir / f"{pol_name}.pol").write_text(text, encoding="utf-8")
+            print(
+                f"{path} -> {acl_dir}/ ({len(pol_files)} .pol file(s); "
+                f"upload to the switch before loading the .xsf)"
+            )
 
         # Stacked source: also emit the stack bring-up runbook (the .xsf must be
         # loaded only after the stack exists).

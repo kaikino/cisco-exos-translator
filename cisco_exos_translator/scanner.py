@@ -13,6 +13,10 @@ RE_BLOCK_VLAN = re.compile(r"^vlan\s+(.+)$", re.IGNORECASE)
 RE_BLOCK_IFACE_RANGE = re.compile(r"^interface\s+range\s+(.+)$", re.IGNORECASE)
 #   e.g. "interface GigabitEthernet1/0/1"            -> capture "GigabitEthernet1/0/1"
 RE_BLOCK_IFACE = re.compile(r"^interface\s+(.+)$", re.IGNORECASE)
+#   e.g. "ip access-list extended SERVERS-IN"        -> capture (1) type (2) name
+RE_BLOCK_ACL = re.compile(
+    r"^ip\s+access-list\s+(standard|extended)\s+(\S+)$", re.IGNORECASE
+)
 
 #   bare "!" separator line
 RE_COMMENT_LINE = re.compile(r"^\s*!\s*$")
@@ -50,9 +54,10 @@ def scan_config(text: str) -> list[ConfigBlock]:
 
         # check if line is a header
         vlan_match = RE_BLOCK_VLAN.match(line.text)
+        acl_match = RE_BLOCK_ACL.match(line.text)
         if_range_match = RE_BLOCK_IFACE_RANGE.match(line.text)
         iface_match = None if if_range_match else RE_BLOCK_IFACE.match(line.text)
-        if vlan_match or if_range_match or iface_match:
+        if vlan_match or acl_match or if_range_match or iface_match:
             # flush pending global lines
             if global_lines:
                 blocks.append(
@@ -68,6 +73,9 @@ def scan_config(text: str) -> list[ConfigBlock]:
             # determine block type
             if vlan_match:
                 kind = "vlan"
+                context = line.text
+            elif acl_match:
+                kind = "acl"
                 context = line.text
             elif if_range_match:
                 kind = "interface_range"

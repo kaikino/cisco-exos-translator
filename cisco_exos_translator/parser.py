@@ -10,8 +10,10 @@ from .helpers import (
     parse_interface_identity,
     parse_port_channel_id,
     parse_vlan_list,
+    wildcard_to_cidr,
 )
 from .models import (
+    AclRule,
     BaseInterface,
     ConfigBlock,
     ParsedConfig,
@@ -22,7 +24,7 @@ from .models import (
     UnsupportedLine,
     Vlan,
 )
-from .scanner import RE_BLOCK_IFACE, RE_BLOCK_IFACE_RANGE, RE_BLOCK_VLAN
+from .scanner import RE_BLOCK_ACL, RE_BLOCK_IFACE, RE_BLOCK_IFACE_RANGE, RE_BLOCK_VLAN
 
 # command line pattern matching
 
@@ -74,6 +76,14 @@ RE_CHANNEL_GROUP = re.compile(
     r"^channel-group\s+(\d+)\s+mode\s+(active|passive|on|auto|desirable)$",
     re.IGNORECASE,
 )
+#   e.g. "ip access-group SERVERS-IN in"        -> capture (1) name (2) direction
+RE_ACCESS_GROUP = re.compile(
+    r"^ip\s+access-group\s+(\S+)\s+(in|out)$", re.IGNORECASE
+)
+#   e.g. "access-list 100 permit tcp any any eq 22" -> capture (1) number (2) ACE
+RE_NUMBERED_ACL = re.compile(r"^access-list\s+(\d+)\s+(.+)$", re.IGNORECASE)
+#   dotted-quad token, e.g. "10.1.0.0"
+RE_DOTTED_QUAD = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
 #   e.g. "no switchport"  -> port becomes routed (L3), i.e. out of L2 scope
 RE_NO_SWITCHPORT = re.compile(r"^no\s+switchport$", re.IGNORECASE)
 #   e.g. "ip address 10.0.0.1 255.255.255.252"  -> also implies a routed (L3) port
@@ -242,11 +252,129 @@ def _apply_interface_line(
             unsupported("channel-group is not valid on a logical interface")
         return
 
+    m = RE_ACCESS_GROUP.match(text)
+    if m:
+        if m.group(2).lower() == "in":
+            iface.access_group_in = m.group(1)
+        else:
+            unsupported("egress ACL (ip access-group out) is not supported")
+        return
+
     if RE_NO_SWITCHPORT.match(text) or RE_IP_ADDRESS.match(text):
         iface.mode = "routed"
         return
 
     unsupported("unsupported or unhandled interface command")
+
+
+# consume one address spec from the token list: any | host A | A wildcard | A
+# returns a CIDR string or None (= any); raises ValueError on unsupported forms
+def _take_acl_addr(toks: list[str], allow_bare: bool) -> str | None:
+    if not toks:
+        raise ValueError("missing address")
+    t = toks.pop(0)
+    if t.lower() == "any":
+        return None
+    if t.lower() == "host":
+        if not toks or not RE_DOTTED_QUAD.match(toks[0]):
+            raise ValueError("invalid host address")
+        return f"{toks.pop(0)}/32"
+    if not RE_DOTTED_QUAD.match(t):
+        raise ValueError(f"unsupported address token '{t}'")
+    # "A wildcard" when the next token is also dotted-quad; bare A (standard) = host
+    if toks and RE_DOTTED_QUAD.match(toks[0]):
+        cidr = wildcard_to_cidr(t, toks.pop(0))
+        if cidr is None:
+            raise ValueError("non-contiguous wildcard mask")
+        return None if cidr.endswith("/0") else cidr
+    if allow_bare:
+        return f"{t}/32"
+    raise ValueError("missing wildcard mask")
+
+
+# consume an optional "eq N" / "range N M" port spec; raises on other operators
+def _take_acl_port(toks: list[str]) -> tuple[int, int] | None:
+    if not toks:
+        return None
+    op = toks[0].lower()
+    if op in ("gt", "lt", "neq"):
+        raise ValueError(f"port operator '{op}' not supported")
+    if op == "eq":
+        if len(toks) < 2 or not toks[1].isdigit():
+            raise ValueError("only numeric ports are supported")
+        toks.pop(0)
+        p = int(toks.pop(0))
+        return (p, p)
+    if op == "range":
+        if len(toks) < 3 or not (toks[1].isdigit() and toks[2].isdigit()):
+            raise ValueError("only numeric port ranges are supported")
+        toks.pop(0)
+        return (int(toks.pop(0)), int(toks.pop(0)))
+    return None
+
+
+# parse one ACE line into an AclRule; raises ValueError for anything outside
+# the v1 subset (caller reports it as an unsupported line, never dropped)
+def _parse_ace(text: str, extended: bool, line_no: int) -> AclRule:
+    toks = text.split()
+    if toks and toks[0].isdigit():  # optional sequence number
+        toks.pop(0)
+    if not toks:
+        raise ValueError("empty ACE")
+
+    if toks[0].lower() == "remark":
+        return AclRule(action="remark", remark=" ".join(toks[1:]), line_number=line_no)
+
+    action = toks.pop(0).lower()
+    if action not in ("permit", "deny"):
+        raise ValueError(f"unsupported ACL command '{action}'")
+    rule = AclRule(action=action, line_number=line_no)
+
+    if extended:
+        if not toks:
+            raise ValueError("missing protocol")
+        proto = toks.pop(0).lower()
+        if proto in ("tcp", "udp", "icmp"):
+            rule.protocol = proto
+        elif proto.isdigit():
+            rule.protocol = proto
+        elif proto != "ip":
+            raise ValueError(f"protocol '{proto}' not supported")
+        rule.source = _take_acl_addr(toks, allow_bare=False)
+        if rule.protocol in ("tcp", "udp"):
+            rule.source_port = _take_acl_port(toks)
+        rule.destination = _take_acl_addr(toks, allow_bare=False)
+        if rule.protocol in ("tcp", "udp"):
+            rule.destination_port = _take_acl_port(toks)
+    else:
+        rule.source = _take_acl_addr(toks, allow_bare=True)
+
+    if toks:  # never partially translate an ACE: leftover tokens reject the line
+        raise ValueError(f"unsupported token '{toks[0]}'")
+    return rule
+
+
+# parse an "ip access-list standard|extended <name>" block
+def _parse_acl_block(config: ParsedConfig, block: ConfigBlock) -> None:
+    assert block.header is not None
+    header_match = RE_BLOCK_ACL.match(block.header.text)
+    if not header_match:
+        return
+    extended = header_match.group(1).lower() == "extended"
+    rules = config.acls.setdefault(header_match.group(2), [])
+
+    for line in block.body:
+        try:
+            rules.append(_parse_ace(line.text, extended, line.line_number))
+        except ValueError as exc:
+            config.unsupported_lines.append(
+                UnsupportedLine(
+                    line_number=line.line_number,
+                    context=block.context,
+                    text=line.text,
+                    reason=str(exc),
+                )
+            )
 
 
 # parse top-level lines against global expressions: hostname and stack provisioning
@@ -270,6 +398,29 @@ def _parse_global_block(config: ParsedConfig, block: ConfigBlock) -> None:
             member = _get_or_create_stack_member(config, int(m.group(1)))
             member.priority = int(m.group(2))
             continue
+
+        m = RE_NUMBERED_ACL.match(text)
+        if m:
+            num = int(m.group(1))
+            # standard 1-99/1300-1999, extended 100-199/2000-2699
+            standard = 1 <= num <= 99 or 1300 <= num <= 1999
+            extended = 100 <= num <= 199 or 2000 <= num <= 2699
+            if standard or extended:
+                try:
+                    config.acls.setdefault(str(num), []).append(
+                        _parse_ace(m.group(2), extended, line.line_number)
+                    )
+                    continue
+                except ValueError as exc:
+                    config.unsupported_lines.append(
+                        UnsupportedLine(
+                            line_number=line.line_number,
+                            context="global",
+                            text=text,
+                            reason=str(exc),
+                        )
+                    )
+                    continue
 
         config.unsupported_lines.append(
             UnsupportedLine(

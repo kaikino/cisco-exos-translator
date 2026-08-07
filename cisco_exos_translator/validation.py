@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import re
+
 from .models import BaseInterface, ParsedConfig, PortChannelInterface
+
+# unsupported-line contexts/texts that belong to an ACL, for incompleteness checks
+RE_ACL_CONTEXT = re.compile(r"^ip\s+access-list\s+\S+\s+(\S+)$", re.IGNORECASE)
+RE_ACL_GLOBAL = re.compile(r"^access-list\s+(\d+)\s", re.IGNORECASE)
 
 
 def validate_parsed_config(config: ParsedConfig) -> list[str]:
@@ -56,5 +62,18 @@ def validate_parsed_config(config: ParsedConfig) -> list[str]:
             warnings.append(
                 f"Port-channel{po_id}: Port-channel exists but has no member interfaces"
             )
+
+    # ACLs with untranslated ACEs are semantically incomplete (a skipped deny
+    # over-permits); count them per ACL and warn once
+    dropped: dict[str, int] = {}
+    for u in config.unsupported_lines:
+        m = RE_ACL_CONTEXT.match(u.context) or RE_ACL_GLOBAL.match(u.text)
+        if m:
+            dropped[m.group(1)] = dropped.get(m.group(1), 0) + 1
+    for acl in sorted(dropped):
+        warnings.append(
+            f"ACL {acl}: {dropped[acl]} rule(s) could not be translated; the "
+            f"generated ACL is incomplete -- review before applying"
+        )
 
     return warnings

@@ -130,6 +130,18 @@ def parse_interface_identity(
     return (type_match.group(1) if type_match else canonical, None, None, None)
 
 
+# Convert Cisco "addr wildcard" to CIDR ("10.1.0.0/24"); None if the wildcard
+# mask is non-contiguous (not expressible in CIDR)
+def wildcard_to_cidr(addr: str, wildcard: str) -> Optional[str]:
+    octets = wildcard.split(".")
+    if len(octets) != 4 or not all(o.isdigit() and int(o) <= 255 for o in octets):
+        return None
+    w = sum(int(o) << (24 - 8 * i) for i, o in enumerate(octets))
+    if w & (w + 1) != 0:  # contiguous low-order ones <=> w+1 is a power of two
+        return None
+    return f"{addr}/{32 - w.bit_length()}"
+
+
 # Return numeric Port-channel ID from a canonical or raw name, else None
 def parse_port_channel_id(name: str) -> Optional[int]:
     match = RE_PORT_CHANNEL.match(canonicalize_interface_name(name))
