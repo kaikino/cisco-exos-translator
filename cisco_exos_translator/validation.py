@@ -17,8 +17,11 @@ def validate_parsed_config(config: ParsedConfig) -> list[str]:
     defined_vlans = set(config.vlans.keys())
 
     def check_interface(name: str, iface: BaseInterface, context_label: str) -> None:
-        # Routed (L3) interface
-        if iface.mode == "routed":
+        # Routed (L3) interface; addressed SVIs are translated (VLAN ipaddress)
+        # so only the rest is out of scope
+        if iface.mode == "routed" and not (
+            iface.ip_address and iface.interface_type.lower() == "vlan"
+        ):
             warnings.append(
                 f"{context_label} {name}: routed interface (no switchport / ip address) "
                 f"is outside L2 conversion scope"

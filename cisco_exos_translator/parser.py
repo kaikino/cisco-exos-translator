@@ -7,6 +7,7 @@ import re
 from .helpers import (
     canonicalize_interface_name,
     expand_interface_range,
+    netmask_to_cidr,
     parse_interface_identity,
     parse_port_channel_id,
     parse_vlan_list,
@@ -86,8 +87,21 @@ RE_NUMBERED_ACL = re.compile(r"^access-list\s+(\d+)\s+(.+)$", re.IGNORECASE)
 RE_DOTTED_QUAD = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
 #   e.g. "no switchport"  -> port becomes routed (L3), i.e. out of L2 scope
 RE_NO_SWITCHPORT = re.compile(r"^no\s+switchport$", re.IGNORECASE)
-#   e.g. "ip address 10.0.0.1 255.255.255.252"  -> also implies a routed (L3) port
+#   e.g. "ip address 10.0.0.1 255.255.255.0 {secondary}" -> capture addr, mask
+RE_IP_ADDRESS_FULL = re.compile(
+    r"^ip\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)(\s+secondary)?$",
+    re.IGNORECASE,
+)
+#   e.g. "ip address dhcp" and other forms -> still marks the port as routed
 RE_IP_ADDRESS = re.compile(r"^ip\s+address\s+", re.IGNORECASE)
+#   e.g. "ip route 0.0.0.0 0.0.0.0 10.0.0.1" -> dest, mask, next-hop (IP only)
+RE_IP_ROUTE = re.compile(
+    r"^ip\s+route\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)$",
+    re.IGNORECASE,
+)
+#   "ip routing" is realized per-VLAN via "enable ipforwarding vlan", so the
+#   global line is consumed without output
+RE_IP_ROUTING = re.compile(r"^ip\s+routing$", re.IGNORECASE)
 
 
 # _get_or_create_* helpers return the IR object for a key if it exists or creates it otherwise
@@ -260,6 +274,19 @@ def _apply_interface_line(
             unsupported("egress ACL (ip access-group out) is not supported")
         return
 
+    m = RE_IP_ADDRESS_FULL.match(text)
+    if m:
+        iface.mode = "routed"
+        if m.group(3):
+            unsupported("secondary IP address is not supported")
+            return
+        cidr = netmask_to_cidr(m.group(1), m.group(2))
+        if cidr is None:
+            unsupported("invalid netmask")
+            return
+        iface.ip_address = cidr
+        return
+
     if RE_NO_SWITCHPORT.match(text) or RE_IP_ADDRESS.match(text):
         iface.mode = "routed"
         return
@@ -398,6 +425,17 @@ def _parse_global_block(config: ParsedConfig, block: ConfigBlock) -> None:
             member = _get_or_create_stack_member(config, int(m.group(1)))
             member.priority = int(m.group(2))
             continue
+
+        if RE_IP_ROUTING.match(text):
+            continue  # realized per-VLAN via "enable ipforwarding vlan"
+
+        m = RE_IP_ROUTE.match(text)
+        if m:
+            cidr = netmask_to_cidr(m.group(1), m.group(2))
+            if cidr is not None:
+                config.static_routes.append((cidr, m.group(3)))
+                continue
+            # invalid mask falls through to the unsupported-line report
 
         m = RE_NUMBERED_ACL.match(text)
         if m:

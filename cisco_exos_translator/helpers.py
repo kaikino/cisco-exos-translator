@@ -130,16 +130,32 @@ def parse_interface_identity(
     return (type_match.group(1) if type_match else canonical, None, None, None)
 
 
+# Parse a dotted quad ("255.255.255.0") to a 32-bit int; None if malformed
+def _quad_to_int(quad: str) -> Optional[int]:
+    octets = quad.split(".")
+    if len(octets) != 4 or not all(o.isdigit() and int(o) <= 255 for o in octets):
+        return None
+    return sum(int(o) << (24 - 8 * i) for i, o in enumerate(octets))
+
+
 # Convert Cisco "addr wildcard" to CIDR ("10.1.0.0/24"); None if the wildcard
 # mask is non-contiguous (not expressible in CIDR)
 def wildcard_to_cidr(addr: str, wildcard: str) -> Optional[str]:
-    octets = wildcard.split(".")
-    if len(octets) != 4 or not all(o.isdigit() and int(o) <= 255 for o in octets):
-        return None
-    w = sum(int(o) << (24 - 8 * i) for i, o in enumerate(octets))
-    if w & (w + 1) != 0:  # contiguous low-order ones <=> w+1 is a power of two
+    w = _quad_to_int(wildcard)
+    if w is None or w & (w + 1) != 0:  # low-order ones <=> w+1 is a power of two
         return None
     return f"{addr}/{32 - w.bit_length()}"
+
+
+# Convert "addr netmask" (e.g. 255.255.255.0) to CIDR; None if invalid
+def netmask_to_cidr(addr: str, netmask: str) -> Optional[str]:
+    m = _quad_to_int(netmask)
+    if m is None:
+        return None
+    inv = ~m & 0xFFFFFFFF
+    if inv & (inv + 1) != 0:
+        return None
+    return f"{addr}/{32 - inv.bit_length()}"
 
 
 # Return numeric Port-channel ID from a canonical or raw name, else None

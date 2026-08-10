@@ -51,6 +51,7 @@ class BaseInterface:
     trunk_native_vlan: Optional[int] = None
     shutdown: bool = False
     access_group_in: Optional[str] = None  # "ip access-group <name> in"
+    ip_address: Optional[str] = None  # CIDR from "ip address A MASK" (SVIs)
     source_lines: list[int] = field(default_factory=list)
     unsupported_lines: list[UnsupportedLine] = field(default_factory=list)
 
@@ -96,6 +97,8 @@ class ParsedConfig:
     vlans: dict[int, Vlan] = field(default_factory=dict)
     # ACL name (or number as str) -> ordered rules
     acls: dict[str, list[AclRule]] = field(default_factory=dict)
+    # static routes as (destination CIDR, next-hop IP)
+    static_routes: list[tuple[str, str]] = field(default_factory=list)
     # all interfaces (physical and port-channel) keyed by canonical name
     interfaces: dict[str, BaseInterface] = field(default_factory=dict)
     stack_members: dict[int, StackMember] = field(default_factory=dict)

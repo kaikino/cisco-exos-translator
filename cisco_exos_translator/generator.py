@@ -15,6 +15,15 @@ def _is_svi(iface: PhysicalInterface) -> bool:
     return iface.interface_type.lower() == "vlan"
 
 
+# "Vlan10" -> 10; None if the SVI name has no usable VLAN id
+RE_SVI_ID = re.compile(r"^vlan(\d+)$", re.IGNORECASE)
+
+
+def _svi_vlan_id(iface: PhysicalInterface) -> int | None:
+    m = RE_SVI_ID.match(iface.canonical_name)
+    return int(m.group(1)) if m else None
+
+
 # Translate a Cisco <member>/<module>/<port> name to an EXOS port string
 # EXOS uses "<slot>:<port>" on a stack or bare "<port>" standalone; only module 0
 # maps cleanly, so a non-zero (uplink) module becomes a placeholder to replace
@@ -71,6 +80,7 @@ def _sanitize_vlan_name(name: str) -> str:
 # Map every VLAN id that must exist in EXOS (defined + referenced) to a name
 def _build_vlan_name_map(config: ParsedConfig, warnings: list[str]) -> dict[int, str]:
     # Collect VLANs referenced by any port (access / trunk allowed / native)
+    # or by an addressed SVI (its VLAN must exist to carry the IP)
     referenced: set[int] = set()
     for iface in config.interfaces.values():
         if iface.access_vlan is not None:
@@ -78,6 +88,10 @@ def _build_vlan_name_map(config: ParsedConfig, warnings: list[str]) -> dict[int,
         referenced.update(iface.trunk_allowed_vlans)
         if iface.trunk_native_vlan is not None:
             referenced.add(iface.trunk_native_vlan)
+        if iface.ip_address and isinstance(iface, PhysicalInterface) and _is_svi(iface):
+            vid = _svi_vlan_id(iface)
+            if vid is not None:
+                referenced.add(vid)
 
     # Referenced-but-undefined VLANs are still created so the output is valid
     # (tag 1 is excluded: it maps to the built-in Default, not an auto-created VLAN)
@@ -544,10 +558,9 @@ def generate_exos_config(
         if name in bundled:
             continue
         if _is_svi(iface):
-            warnings.append(
-                f"{name}: SVI (logical L3 interface) is out of L2 scope; skipped"
-            )
-            out.append(f"# {name}: SVI skipped (L3, out of scope)")
+            # addressed SVIs are handled by the L3 section below
+            if not iface.ip_address:
+                warnings.append(f"{name}: SVI with no IP address; skipped")
             continue
         if iface.mode == "routed":
             warnings.append(
@@ -572,6 +585,28 @@ def generate_exos_config(
         if iface.shutdown:
             out.append(f"disable ports {port}")
 
+    # L3: addressed SVIs -> VLAN IP + per-VLAN forwarding, then static routes
+    l3_lines: list[str] = []
+    for name, iface in sorted(config.interfaces.items()):
+        if not (isinstance(iface, PhysicalInterface) and _is_svi(iface) and iface.ip_address):
+            continue
+        vid = _svi_vlan_id(iface)
+        if vid is None or vid not in vlan_names:
+            continue
+        if iface.shutdown:
+            warnings.append(f"{name}: SVI is shutdown; L3 config not emitted")
+            continue
+        vlan = "Default" if vid == 1 else f'"{vlan_names[vid]}"'
+        l3_lines.append(f"configure vlan {vlan} ipaddress {iface.ip_address}")
+        l3_lines.append(f"enable ipforwarding vlan {vlan}")
+    for dest, gw in config.static_routes:
+        target = "default" if dest == "0.0.0.0/0" else dest
+        l3_lines.append(f"configure iproute add {target} {gw}")
+    if l3_lines:
+        out.append("")
+        out.append("# L3 (SVI addresses, routing)")
+        out.extend(l3_lines)
+
     # ACLs: Cisco ACLs referenced by "ip access-group <name> in" become EXOS
     # policy files (.pol, emitted as separate outputs) applied ingress; the
     # .pol files must be on the switch before this script is loaded
@@ -582,11 +617,11 @@ def generate_exos_config(
             continue
         if isinstance(iface, PhysicalInterface):
             if _is_svi(iface) or iface.mode == "routed":
-                # a router ACL (RACL) filtering routed traffic; meaningful only
-                # once L3 (SVI/VLAN addressing) is translated
+                # a router ACL (RACL) filtering routed traffic; applying to the
+                # VLAN is the next step now that basic L3 is translated
                 warnings.append(
-                    f"{name}: ACL {acl} is applied on an SVI/routed interface "
-                    f"(router ACL); not translated -- requires L3 support"
+                    f"{name}: ACL {acl} is a router ACL (SVI/routed interface); "
+                    f"VLAN-applied ACLs are not yet supported"
                 )
                 continue
             if name in bundled:
