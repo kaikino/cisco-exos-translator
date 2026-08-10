@@ -27,6 +27,10 @@ For each input, writes two files alongside it:
   entry still overrides the rule per-port.
 - **`<name>.xsf`** — the EXOS script, regenerated on every run from the config
   plus the mapping.
+- **`<name>-acls/*.pol`** (only when the config has ACLs applied with
+  `ip access-group ... in`) — one EXOS policy file per ACL. Upload them to the
+  switch (`tftp put ...`) **before** loading the `.xsf`, which applies them by
+  name.
 - **`<name>.stack-setup.txt`** (only when the source config has 2+ stack
   members) — the stack bring-up runbook. EXOS stacking is a mode change with
   per-node reboots and a fresh config context, so it cannot be part of the
@@ -82,6 +86,9 @@ running-config text
 | `shutdown` | `disable ports <p>` |
 | `description X` | `configure ports <p> description-string "X"` |
 | stack member/port (`Gi1/0/1`, `Gi2/0/24`) | `slot:port` when stacked, bare `port` when standalone |
+| IPv4 ACLs (numbered & named, standard & extended) + `ip access-group <name> in` | one policy file (`<name>-acls/<ACL>.pol`) per applied ACL — entries in ACE order, `remark` kept as `#` comments, trailing deny-all (EXOS permits unmatched traffic by default) — applied via `configure access-list <ACL> ports <p> ingress`; upload the `.pol` files before loading the `.xsf` |
+| `interface VlanN` + `ip address A MASK` (SVI) | `configure vlan "<name>" ipaddress A/len` + `enable ipforwarding vlan "<name>"` (SVI-only VLANs are auto-created) |
+| `ip route P MASK GW` | `configure iproute add P/len GW` (`default` for 0.0.0.0/0); `ip routing` is consumed (realized per-VLAN) |
 
 ### Behavioral details
 
@@ -123,15 +130,25 @@ Embedded as `#` comments at the top of each `.xsf`:
 
 ## Not supported (out of scope)
 
-- **Layer 3**: `ip address` is only used to flag a port as routed (the address
-  is not captured); `ip route`, SVIs, and `ip forwarding` are not translated.
+- **Layer 3 beyond the basics**: SVI IPv4 addresses and static IP routes are
+  translated (see above); still out of scope are routed *physical* ports (EXOS
+  has no port IPs), `secondary` addresses, non-IP next-hops (`Null0`,
+  interface next-hops), VRFs, and routing protocols. Router ACLs on SVIs are
+  parsed but not yet applied to VLANs (warned).
 - **Stack provisioning** — the Cisco SKU cannot be mapped to an EXOS slot type
   (comments only). Member count and priorities do translate: they drive the
   generated `.stack-setup.txt` runbook, but stack formation itself is a manual,
   reboot-bound procedure.
 - **Uplink-module port renumbering** — requires the target platform's port map;
   emitted as a `{uplink-mN-pM}` placeholder for manual replacement.
-- STP/spanning-tree, port speed/duplex, PoE, ACLs, QoS, storm-control, voice
+- **ACL edge cases** — supported subset is permit/deny, `ip|tcp|udp|icmp`/
+  numeric protocol, `any`/`host`/contiguous wildcard, numeric `eq`/`range`
+  ports, `remark`, interface `in`. Everything else (`established`, `log`,
+  `gt/lt/neq`, named ports, non-contiguous wildcards, object-groups, `out`
+  direction, vty/SNMP/route-map contexts) is reported, never silently dropped;
+  ACLs with untranslated rules get an "incomplete" warning. See
+  [docs/acl-patterns.md](docs/acl-patterns.md).
+- STP/spanning-tree, port speed/duplex, PoE, QoS, storm-control, voice
   VLANs, LACP timer tuning.
 - **Multi-switch topology** — configs are translated independently; no VLAN
   consolidation, inter-switch link, or distributed-LAG correlation.
