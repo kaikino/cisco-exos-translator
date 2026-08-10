@@ -18,8 +18,8 @@ RE_BLOCK_ACL = re.compile(
     r"^ip\s+access-list\s+(standard|extended)\s+(\S+)$", re.IGNORECASE
 )
 
-#   bare "!" separator line
-RE_COMMENT_LINE = re.compile(r"^\s*!\s*$")
+#   "!" comment/separator line, bare or with trailing text
+RE_COMMENT_LINE = re.compile(r"^\s*!")
 
 
 def scan_config(text: str) -> list[ConfigBlock]:
