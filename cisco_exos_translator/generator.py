@@ -610,42 +610,59 @@ def generate_exos_config(
     # ACLs: Cisco ACLs referenced by "ip access-group <name> in" become EXOS
     # policy files (.pol, emitted as separate outputs) applied ingress; the
     # .pol files must be on the switch before this script is loaded
-    applied: dict[str, list[str]] = {}  # acl name -> EXOS ports using it
+    # Targets: switchports -> "ports N"; SVIs (router ACLs) -> 'vlan "NAME"'
+    applied: dict[str, list[str]] = {}  # acl name -> EXOS apply targets
     for name, iface in sorted(config.interfaces.items()):
         acl = iface.access_group_in
         if not acl:
             continue
         if isinstance(iface, PhysicalInterface):
-            if _is_svi(iface) or iface.mode == "routed":
-                # a router ACL (RACL) filtering routed traffic; applying to the
-                # VLAN is the next step now that basic L3 is translated
+            if _is_svi(iface):
+                vid = _svi_vlan_id(iface)
+                if vid is None or vid not in vlan_names:
+                    warnings.append(
+                        f"{name}: ACL {acl} is a router ACL but the SVI's VLAN "
+                        f"is not in the output; not applied"
+                    )
+                    continue
+                vlan = "Default" if vid == 1 else f'"{vlan_names[vid]}"'
+                applied.setdefault(acl, []).append(f"vlan {vlan}")
+                # EXOS VLAN ACLs also filter bridged intra-VLAN traffic, which
+                # a Cisco router ACL never touches
                 warnings.append(
-                    f"{name}: ACL {acl} is a router ACL (SVI/routed interface); "
-                    f"VLAN-applied ACLs are not yet supported"
+                    f"{name}: ACL {acl} applied to vlan {vlan} is stricter than "
+                    f"the Cisco router ACL: EXOS also filters intra-VLAN "
+                    f"(bridged) traffic, not just routed traffic"
+                )
+                continue
+            if iface.mode == "routed":
+                warnings.append(
+                    f"{name}: ACL {acl} on a routed physical port; not "
+                    f"translated (routed ports are out of scope)"
                 )
                 continue
             if name in bundled:
                 continue
             if name in port_map:
-                applied.setdefault(acl, []).append(port_map[name])
+                applied.setdefault(acl, []).append(f"ports {port_map[name]}")
         else:  # bundle: ACL applies on the LAG master port
             po_id = next(
                 (pid for pid, po in config.port_channels.items()
                  if po.canonical_name == name), None
             )
             if po_id in lag_map:
-                applied.setdefault(acl, []).append(lag_map[po_id][0])
+                applied.setdefault(acl, []).append(f"ports {lag_map[po_id][0]}")
 
     for acl in sorted(set(config.acls) - set(applied)):
         warnings.append(
-            f"ACL {acl}: defined but not applied to any translated port; skipped"
+            f"ACL {acl}: defined but not applied to any translated target; skipped"
         )
     pol_files: dict[str, str] = {}  # policy name -> .pol file content
     if applied:
         out.append("")
         out.append("# ACLs (policy files; upload each <name>.pol to the switch")
         out.append("# BEFORE loading this script)")
-    for acl, ports in sorted(applied.items()):
+    for acl, targets in sorted(applied.items()):
         rules = config.acls.get(acl)
         if not rules:
             warnings.append(
@@ -656,8 +673,8 @@ def generate_exos_config(
         # policy name must equal the .pol basename; reuse the VLAN name rules
         base = _sanitize_vlan_name(acl)
         pol_files[base] = _acl_policy(acl, rules)
-        for port in sorted(set(ports)):
-            out.append(f"configure access-list {base} ports {port} ingress")
+        for target in sorted(set(targets)):
+            out.append(f"configure access-list {base} {target} ingress")
 
     # Prepend the translation reference, then the warning banner, so both travel
     # with the .xsf (warnings first, then the reference, then the config)

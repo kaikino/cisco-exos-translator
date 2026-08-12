@@ -66,6 +66,7 @@ Extended ACE の構成要素ごと。EXOS 欄は `.pol` の entry 内に記述�
 | コンテキスト | Cisco 構文例 | 頻度 | v1 |
 |---|---|---|---|
 | インターフェース in | `ip access-group SERVERS-IN in` | common | ◯ `configure access-list <name> ports <p> ingress` (.pol を事前アップロード) |
+| SVI (Router ACL) | `interface VlanN` + `ip access-group X in` | common | ◯ `configure access-list <name> vlan "<VLAN名>" ingress` ※EXOSはVLAN内ブリッジ通信もフィルタするためCiscoより厳しくなる(警告を出力) |
 | インターフェース out | `ip access-group X out` | occasional | △ EXOS egress は制約あり(空マッチ不可、機種依存) |
 | VTY | `access-class MGMT in` | common | △ EXOS では別機構(SSH/telnet アクセス制御) |
 | SNMP | `snmp-server community X RO MGMT` | common | △ 別機構 |
@@ -99,6 +100,10 @@ Extended ACE の構成要素ごと。EXOS 欄は `.pol` の entry 内に記述�
 
 - `out` 適用、`established`、`log`、ICMP タイプ、`gt`/`lt`/`neq`、
   object-group、VTY / SNMP 等の別コンテキスト参照、IPv6、MAC ACL
+
+**対応済み(注意つき): SVI への Router ACL** — VLAN への ingress 適用として
+変換される。ただし EXOS は VLAN 内のブリッジ通信もフィルタするため Cisco の
+Router ACL より厳しくなる(変換時に警告を出力)。
 
 **対象外:**
 

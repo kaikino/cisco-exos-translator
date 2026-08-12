@@ -134,7 +134,9 @@ Embedded as `#` comments at the top of each `.xsf`:
   translated (see above); still out of scope are routed *physical* ports (EXOS
   has no port IPs), `secondary` addresses, non-IP next-hops (`Null0`,
   interface next-hops), VRFs, and routing protocols. Router ACLs on SVIs are
-  parsed but not yet applied to VLANs (warned).
+  translated to VLAN-applied ACLs (`configure access-list <ACL> vlan "<name>"
+  ingress`) with a warning: EXOS also filters intra-VLAN bridged traffic,
+  which a Cisco router ACL does not.
 - **Stack provisioning** — the Cisco SKU cannot be mapped to an EXOS slot type
   (comments only). Member count and priorities do translate: they drive the
   generated `.stack-setup.txt` runbook, but stack formation itself is a manual,
