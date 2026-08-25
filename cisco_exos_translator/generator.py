@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import re
 
-from .models import ParsedConfig, PhysicalInterface
+from .models import ParsedConfig, PhysicalInterface, PortChannelInterface
 
 
 # SVIs ("interface Vlan10") are logical L3 interfaces, not ports; excluded from
@@ -92,6 +92,9 @@ def _build_vlan_name_map(config: ParsedConfig, warnings: list[str]) -> dict[int,
             vid = _svi_vlan_id(iface)
             if vid is not None:
                 referenced.add(vid)
+    # SPAN source VLANs must exist for "configure mirror ... add vlan" to work
+    for sess in config.monitor_sessions.values():
+        referenced.update(vid for vid, _direction in sess.source_vlans)
 
     # Referenced-but-undefined VLANs are still created so the output is valid
     # (tag 1 is excluded: it maps to the built-in Default, not an auto-created VLAN)
@@ -184,6 +187,11 @@ def build_default_mapping(config: ParsedConfig) -> dict:
             "mode": "lacp" if lacp else "static",
         }
 
+    mirrors = {
+        str(sid): _sanitize_vlan_name(f"monitor_{sid}")
+        for sid in sorted(config.monitor_sessions)
+    }
+
     return {
         "_help": [
             "Translation mapping: derived defaults from the Cisco config.",
@@ -197,6 +205,8 @@ def build_default_mapping(config: ParsedConfig) -> dict:
             "       {uplink-mN-pP} then resolves to start + P - 1 automatically.",
             "lags: master must be one of the LAG's member ports; mode is",
             "      'lacp' or 'static'.",
+            "mirrors: Cisco monitor session id -> EXOS mirror instance name",
+            "      (set to 'DefaultMirror' to reuse the built-in instance).",
             "Entries for interfaces no longer in the Cisco config are ignored;",
             "new interfaces get derived defaults until added here.",
         ],
@@ -204,6 +214,7 @@ def build_default_mapping(config: ParsedConfig) -> dict:
         "ports": ports,
         "uplinks": {"start": None},
         "lags": lags,
+        "mirrors": mirrors,
     }
 
 
@@ -307,6 +318,162 @@ def _acl_policy(acl_name: str, rules) -> str:
     return "\n".join(lines) + "\n"
 
 
+# Cisco SPAN direction -> EXOS mirror source filter keyword
+_MIRROR_DIRECTION = {"rx": "ingress", "tx": "egress", "both": "ingress-and-egress"}
+
+
+# Plan the EXOS mirror instances for the config's SPAN sessions.
+# Returns (script lines, canonical names of destination ports, and
+# {session id: (instance name, EXOS monitor ports)} for the reference block).
+# A Cisco SPAN destination port does not switch normal traffic, so the EXOS
+# monitor port is removed from all VLANs and its own L2 config is skipped
+# (handled by the caller via the returned destination-port set).
+def _plan_mirrors(
+    config: ParsedConfig,
+    mapping: dict,
+    port_map: dict[str, str],
+    vlan_names: dict[int, str],
+    bundled: set[str],
+    warnings: list[str],
+) -> tuple[list[str], set[str], dict[int, tuple[str, list[str]]]]:
+    lines: list[str] = []
+    dest_names: set[str] = set()
+    mirror_ref: dict[int, tuple[str, list[str]]] = {}
+    mirror_names = mapping.get("mirrors") or {}
+    used_names: set[str] = set()
+
+    for sid, sess in sorted(config.monitor_sessions.items()):
+        if not (sess.destination_ports and (sess.source_ports or sess.source_vlans)):
+            continue  # validation already warned
+
+        # Destination: physical, non-bundled ports only (an EXOS monitor port
+        # cannot be part of a load-share group)
+        dest_ports: list[str] = []
+        skip = False
+        for name in sess.destination_ports:
+            iface = config.interfaces.get(name)
+            if not isinstance(iface, PhysicalInterface):
+                warnings.append(
+                    f"monitor session {sid}: destination {name} is not a "
+                    f"physical port (an EXOS monitor port cannot be a LAG); "
+                    f"session skipped"
+                )
+                skip = True
+            elif name in bundled:
+                warnings.append(
+                    f"monitor session {sid}: destination {name} is a LAG "
+                    f"member (an EXOS monitor port cannot be in a load-share "
+                    f"group); session skipped"
+                )
+                skip = True
+            elif name in port_map:
+                dest_ports.append(port_map[name])
+        if skip or not dest_ports:
+            continue
+
+        # Mirror instance name: mapping wins, sanitized to EXOS naming rules
+        raw = str(mirror_names.get(str(sid)) or f"monitor_{sid}")
+        name = _sanitize_vlan_name(raw)
+        if name != raw:
+            warnings.append(
+                f"monitor session {sid}: mirror name '{raw}' sanitized to "
+                f"'{name}' (EXOS object naming rules)"
+            )
+        if name in used_names:
+            warnings.append(
+                f"monitor session {sid}: mirror name '{name}' is already used "
+                f"by another session; renamed to '{name}_{sid}'"
+            )
+            name = _sanitize_vlan_name(f"{name}_{sid}")
+        used_names.add(name)
+
+        # Sources: ports (with direction) and VLANs (EXOS mirrors VLANs
+        # ingress-only). A Port-channel source expands to its member ports.
+        src_lines: list[str] = []
+        seen: set[tuple[str, str]] = set()
+        for cname, direction in sess.source_ports:
+            iface = config.interfaces.get(cname)
+            if isinstance(iface, PortChannelInterface):
+                targets = [port_map[m] for m in sorted(iface.members) if m in port_map]
+                if not targets:
+                    warnings.append(
+                        f"monitor session {sid}: source {cname} has no member "
+                        f"ports; source skipped"
+                    )
+                    continue
+                warnings.append(
+                    f"monitor session {sid}: source {cname} expanded to its "
+                    f"member ports ({', '.join(targets)})"
+                )
+            elif cname in port_map:
+                targets = [port_map[cname]]
+            else:
+                continue
+            for port in targets:
+                if (port, direction) in seen:
+                    continue
+                seen.add((port, direction))
+                src_lines.append(
+                    f"configure mirror {name} add port {port} "
+                    f"{_MIRROR_DIRECTION[direction]}"
+                )
+        for vid, direction in sess.source_vlans:
+            if direction != "rx":
+                warnings.append(
+                    f"monitor session {sid}: EXOS VLAN mirroring is "
+                    f"ingress-only; source VLAN {vid} ({direction}) mirrors "
+                    f"ingress traffic only"
+                )
+            if (f"vlan{vid}", "") in seen:
+                continue
+            seen.add((f"vlan{vid}", ""))
+            vlan = "Default" if vid == 1 else f'"{vlan_names[vid]}"'
+            src_lines.append(f"configure mirror {name} add vlan {vlan}")
+        if not src_lines:
+            warnings.append(
+                f"monitor session {sid}: no source could be translated; "
+                f"session skipped"
+            )
+            used_names.discard(name)
+            continue
+
+        if not sess.encapsulation_replicate:
+            warnings.append(
+                f"monitor session {sid}: EXOS mirroring preserves VLAN tags on "
+                f"the copies (Cisco SPAN without 'encapsulation replicate' "
+                f"sends them untagged)"
+            )
+        warnings.append(
+            f"monitor session {sid}: monitor port(s) {', '.join(dest_ports)} "
+            f"removed from all VLANs and dedicated to mirroring (a Cisco SPAN "
+            f"destination does not switch normal traffic)"
+        )
+
+        lines.append(f"# monitor session {sid}")
+        for port in dest_ports:
+            lines.append(f"configure vlan Default delete ports {port}")
+        if name != "DefaultMirror":  # the DefaultMirror instance always exists
+            lines.append(f"create mirror {name}")
+        if len(dest_ports) == 1:
+            lines.append(f"configure mirror {name} to port {dest_ports[0]}")
+        else:
+            lines.append(
+                f"configure mirror {name} to port-list {','.join(dest_ports)}"
+            )
+        lines.extend(src_lines)
+        lines.append(f"enable mirror {name}")
+        dest_names.update(sess.destination_ports)
+        mirror_ref[sid] = (name, dest_ports)
+
+    if len(mirror_ref) > 1:
+        warnings.append(
+            f"{len(mirror_ref)} mirror instances translated: EXOS platforms "
+            f"limit concurrently enabled mirrors (commonly 4 total, 2 with an "
+            f"egress filter); verify against the target platform"
+        )
+    return lines, dest_names, mirror_ref
+
+
 # Summarize every Cisco line the parser could not translate (global and
 # per-interface), deduped by command text with counts and example line numbers
 def _unsupported_summary(config: ParsedConfig, max_unique: int = 40) -> list[str]:
@@ -352,6 +519,7 @@ def _unsupported_summary(config: ParsedConfig, max_unique: int = 40) -> list[str
 def _translation_reference(
     config: ParsedConfig, vlan_names: dict[int, str], port_map: dict[str, str],
     lag_map: dict[int, tuple[str, list[str], bool]],
+    mirror_ref: dict[int, tuple[str, list[str]]],
 ) -> list[str]:
     lines = ["# Translation reference (from the mapping file; edit it and re-run to change)"]
 
@@ -390,6 +558,15 @@ def _translation_reference(
             lines.append(
                 f"#   Port-channel{po_id} -> {master}  "
                 f"(members: {', '.join(members)}; {mode})"
+            )
+
+    # Mirroring: Cisco SPAN session -> EXOS mirror instance and monitor port
+    if mirror_ref:
+        lines.append("# Mirroring (Cisco monitor session -> EXOS mirror instance):")
+        for sid, (name, dest_ports) in sorted(mirror_ref.items()):
+            lines.append(
+                f"#   monitor session {sid} -> {name}  "
+                f"(monitor port: {', '.join(dest_ports)})"
             )
 
     lines.append("")
@@ -487,6 +664,12 @@ def generate_exos_config(
     for po in config.port_channels.values():
         bundled.update(po.members)
 
+    # Mirroring plan (emitted at the end): needed up front because SPAN
+    # destination ports are excluded from normal port configuration
+    mirror_lines, mirror_dest, mirror_ref = _plan_mirrors(
+        config, mapping, port_map, vlan_names, bundled, warnings
+    )
+
     # System
     out.append("# System")
     if config.hostname:
@@ -572,6 +755,28 @@ def generate_exos_config(
             warnings.append(f"{name}: no port mapping entry; skipped")
             continue
 
+        # A SPAN destination port's switchport config is inactive on Cisco;
+        # keep only the description (VLAN handling is in the mirror section)
+        if name in mirror_dest:
+            if (
+                iface.access_vlan is not None
+                or iface.trunk_allowed_vlans
+                or iface.trunk_native_vlan is not None
+                or iface.access_group_in
+                or iface.shutdown
+            ):
+                warnings.append(
+                    f"{name}: SPAN destination port; its L2/ACL/shutdown "
+                    f"config is inactive on Cisco and skipped (port left "
+                    f"enabled so the mirror can transmit)"
+                )
+            if iface.description:
+                out.append(
+                    f"configure ports {port_map[name]} "
+                    f'description-string "{iface.description}"'
+                )
+            continue
+
         port = port_map[name]
         membership = _membership_lines(port, iface, vlan_names, warnings)
 
@@ -643,6 +848,8 @@ def generate_exos_config(
                 continue
             if name in bundled:
                 continue
+            if name in mirror_dest:
+                continue  # inactive on a SPAN destination (warned above)
             if name in port_map:
                 applied.setdefault(acl, []).append(f"ports {port_map[name]}")
         else:  # bundle: ACL applies on the LAG master port
@@ -676,9 +883,15 @@ def generate_exos_config(
         for target in sorted(set(targets)):
             out.append(f"configure access-list {base} {target} ingress")
 
+    # Mirroring: one EXOS mirror instance per translated SPAN session
+    if mirror_lines:
+        out.append("")
+        out.append("# Mirroring (SPAN)")
+        out.extend(mirror_lines)
+
     # Prepend the translation reference, then the warning banner, so both travel
     # with the .xsf (warnings first, then the reference, then the config)
-    out = _translation_reference(config, vlan_names, port_map, lag_map) + out
+    out = _translation_reference(config, vlan_names, port_map, lag_map, mirror_ref) + out
 
     # One banner for all warnings, grouped by source: input problems in the
     # Cisco config, lines dropped as untranslatable, and translation decisions
