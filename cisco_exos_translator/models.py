@@ -81,6 +81,22 @@ class PortChannelInterface(BaseInterface):
             raise ValueError("PortChannelInterface requires a non-negative id")
 
 
+# one Cisco SPAN session ("monitor session N ...") accumulated across its
+# global config lines; only local SPAN is representable (RSPAN/ERSPAN and
+# filters are reported as unsupported lines by the parser)
+@dataclass
+class MonitorSession:
+    session_id: int
+    # (canonical interface name, direction) where direction is rx|tx|both
+    source_ports: list[tuple[str, str]] = field(default_factory=list)
+    # (vlan id, direction)
+    source_vlans: list[tuple[int, str]] = field(default_factory=list)
+    destination_ports: list[str] = field(default_factory=list)  # canonical names
+    # "encapsulation replicate" on the destination (tags preserved on copies)
+    encapsulation_replicate: bool = False
+    source_lines: list[int] = field(default_factory=list)
+
+
 # Stack member provisioning from global config
 @dataclass
 class StackMember:
@@ -101,6 +117,8 @@ class ParsedConfig:
     static_routes: list[tuple[str, str]] = field(default_factory=list)
     # all interfaces (physical and port-channel) keyed by canonical name
     interfaces: dict[str, BaseInterface] = field(default_factory=dict)
+    # SPAN sessions keyed by session id
+    monitor_sessions: dict[int, MonitorSession] = field(default_factory=dict)
     stack_members: dict[int, StackMember] = field(default_factory=dict)
     unsupported_lines: list[UnsupportedLine] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)

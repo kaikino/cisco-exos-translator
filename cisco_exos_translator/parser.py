@@ -17,6 +17,7 @@ from .models import (
     AclRule,
     BaseInterface,
     ConfigBlock,
+    MonitorSession,
     ParsedConfig,
     PhysicalInterface,
     PortChannelInterface,
@@ -102,6 +103,19 @@ RE_IP_ROUTE = re.compile(
 #   "ip routing" is realized per-VLAN via "enable ipforwarding vlan", so the
 #   global line is consumed without output
 RE_IP_ROUTING = re.compile(r"^ip\s+routing$", re.IGNORECASE)
+#   e.g. "monitor session 1 source interface Gi1/0/1 - 2 , Gi1/0/5 rx"
+#   -> capture (1) session id (2) the rest of the line
+RE_MONITOR_SESSION = re.compile(r"^monitor\s+session\s+(\d+)\s+(.+)$", re.IGNORECASE)
+#   the rest of a source line: "interface <list> {rx|tx|both}" or
+#   "vlan <list> {rx|tx|both}"; "remote vlan" (RSPAN) deliberately not matched
+RE_MONITOR_SOURCE = re.compile(
+    r"^source\s+(interface|vlan)\s+(.+?)(?:\s+(rx|tx|both))?$", re.IGNORECASE
+)
+#   the rest of a destination line: "interface <list> {encapsulation replicate}"
+RE_MONITOR_DEST = re.compile(
+    r"^destination\s+interface\s+(.+?)(\s+encapsulation\s+replicate)?$",
+    re.IGNORECASE,
+)
 
 
 # _get_or_create_* helpers return the IR object for a key if it exists or creates it otherwise
@@ -381,6 +395,78 @@ def _parse_ace(text: str, extended: bool, line_no: int) -> AclRule:
     return rule
 
 
+# session id -> MonitorSession
+def _get_or_create_monitor_session(
+    config: ParsedConfig, session_id: int, line_no: int
+) -> MonitorSession:
+    if session_id not in config.monitor_sessions:
+        config.monitor_sessions[session_id] = MonitorSession(session_id=session_id)
+    sess = config.monitor_sessions[session_id]
+    if line_no not in sess.source_lines:
+        sess.source_lines.append(line_no)
+    return sess
+
+
+# expand a SPAN interface list ("Gi1/0/1 - 2 , Gi1/0/5") and reject anything
+# that is not a well-formed physical port or Port-channel (raises ValueError)
+def _expand_monitor_interfaces(text: str) -> list[str]:
+    names = expand_interface_range(text)
+    for name in names:
+        iface_type, member, _module, port = parse_interface_identity(name)
+        if iface_type == "Port-channel":
+            continue
+        if member is None or port is None:
+            raise ValueError(f"unrecognized interface '{name}'")
+    return names
+
+
+# apply one "monitor session <id> <rest>" line; raises ValueError for anything
+# outside local SPAN (RSPAN/ERSPAN, filters) so the caller reports it
+def _apply_monitor_line(
+    config: ParsedConfig, session_id: int, rest: str, line: ScannedLine
+) -> None:
+    m = RE_MONITOR_SOURCE.match(rest)
+    if m:
+        direction = (m.group(3) or "both").lower()  # Cisco default is both
+        if m.group(1).lower() == "interface":
+            names = _expand_monitor_interfaces(m.group(2))
+            sess = _get_or_create_monitor_session(config, session_id, line.line_number)
+            for name in names:
+                # register the port so it gets a mapping entry / EXOS number
+                _get_or_create_interface(config, name, line.line_number)
+                if (name, direction) not in sess.source_ports:
+                    sess.source_ports.append((name, direction))
+        else:
+            # allow IOS's spaced ranges ("100 - 200") before list parsing
+            vids = sorted(parse_vlan_list(re.sub(r"\s*-\s*", "-", m.group(2))))
+            sess = _get_or_create_monitor_session(config, session_id, line.line_number)
+            for vid in vids:
+                if (vid, direction) not in sess.source_vlans:
+                    sess.source_vlans.append((vid, direction))
+        return
+
+    m = RE_MONITOR_DEST.match(rest)
+    if m:
+        names = _expand_monitor_interfaces(m.group(1))
+        sess = _get_or_create_monitor_session(config, session_id, line.line_number)
+        for name in names:
+            _get_or_create_interface(config, name, line.line_number)
+            if name not in sess.destination_ports:
+                sess.destination_ports.append(name)
+        if m.group(2):
+            sess.encapsulation_replicate = True
+        return
+
+    low = rest.lower()
+    if "remote" in low.split():
+        raise ValueError("RSPAN (remote vlan) is not supported")
+    if low.startswith("type"):
+        raise ValueError("only local SPAN is supported (no ERSPAN/capture types)")
+    if low.startswith("filter"):
+        raise ValueError("SPAN filter is not supported")
+    raise ValueError("unsupported monitor session command")
+
+
 # parse an "ip access-list standard|extended <name>" block
 def _parse_acl_block(config: ParsedConfig, block: ConfigBlock) -> None:
     assert block.header is not None
@@ -428,6 +514,21 @@ def _parse_global_block(config: ParsedConfig, block: ConfigBlock) -> None:
 
         if RE_IP_ROUTING.match(text):
             continue  # realized per-VLAN via "enable ipforwarding vlan"
+
+        m = RE_MONITOR_SESSION.match(text)
+        if m:
+            try:
+                _apply_monitor_line(config, int(m.group(1)), m.group(2).strip(), line)
+            except ValueError as exc:
+                config.unsupported_lines.append(
+                    UnsupportedLine(
+                        line_number=line.line_number,
+                        context="global",
+                        text=text,
+                        reason=str(exc),
+                    )
+                )
+            continue
 
         m = RE_IP_ROUTE.match(text)
         if m:

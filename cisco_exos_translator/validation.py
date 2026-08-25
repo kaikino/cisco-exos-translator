@@ -66,6 +66,33 @@ def validate_parsed_config(config: ParsedConfig) -> list[str]:
                 f"Port-channel{po_id}: Port-channel exists but has no member interfaces"
             )
 
+    # SPAN sessions need both a source and a destination to be translatable
+    for sid, sess in sorted(config.monitor_sessions.items()):
+        has_source = bool(sess.source_ports or sess.source_vlans)
+        if not sess.destination_ports and has_source:
+            warnings.append(
+                f"monitor session {sid}: no destination interface; "
+                f"session not translated"
+            )
+        if sess.destination_ports and not has_source:
+            warnings.append(
+                f"monitor session {sid}: no source interface/vlan; "
+                f"session not translated"
+            )
+        overlap = set(sess.destination_ports) & {p for p, _ in sess.source_ports}
+        for name in sorted(overlap):
+            warnings.append(
+                f"monitor session {sid}: {name} is both a source and the "
+                f"destination"
+            )
+        for vid, _direction in sess.source_vlans:
+            # tag 1 is exempt: it maps to the EXOS built-in Default VLAN
+            if vid != 1 and vid not in defined_vlans:
+                warnings.append(
+                    f"monitor session {sid}: source VLAN {vid} "
+                    f"is referenced but not defined"
+                )
+
     # ACLs with untranslated ACEs are semantically incomplete (a skipped deny
     # over-permits); count them per ACL and warn once
     dropped: dict[str, int] = {}
