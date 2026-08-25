@@ -1,0 +1,83 @@
+# WARNINGS — review before deploying
+# Not translated (28 line(s) outside this tool's L2 scope; review for anything you must port manually):
+#   - 'spanning-tree portfast' x9 (lines 20, 38)
+#   - 'storm-control broadcast level 5.00' x8 (lines 21)
+#   - 'switchport voice vlan 100' x8 (lines 19)
+#   - 'end' (line 50)
+#   - 'ntp server 10.0.0.1' (line 4)
+#   - 'snmp-server location Demo Lab' (line 3)
+# Translation (decisions made converting to EXOS):
+#   - TenGigabitEthernet1/1/1: unresolved uplink placeholder '{uplink-m1-p1}'; set uplinks.start in the mapping file (first uplink port number) or replace this port entry individually
+
+# Translation reference (from the mapping file; edit it and re-run to change)
+# VLANs (Cisco tag -> EXOS name):
+#   10 -> USERS
+#   20 -> SERVERS
+#   100 -> VOICE
+# Ports (Cisco name -> EXOS port):
+#   GigabitEthernet1/0/1 -> 1
+#   GigabitEthernet1/0/10 -> 10
+#   GigabitEthernet1/0/11 -> 11
+#   GigabitEthernet1/0/12 -> 12
+#   GigabitEthernet1/0/2 -> 2
+#   GigabitEthernet1/0/3 -> 3
+#   GigabitEthernet1/0/4 -> 4
+#   GigabitEthernet1/0/5 -> 5
+#   GigabitEthernet1/0/6 -> 6
+#   GigabitEthernet1/0/7 -> 7
+#   GigabitEthernet1/0/8 -> 8
+#   GigabitEthernet1/0/9 -> 9
+#   TenGigabitEthernet1/1/1 -> {uplink-m1-p1}  (uplink placeholder; replace)
+# LAG (Cisco Port-channel -> EXOS master port):
+#   Port-channel1 -> 10  (members: 10, 9; lacp)
+
+# System
+configure snmp sysName "SW-DEMO-01"
+
+# VLANs
+create vlan "USERS" tag 10
+create vlan "SERVERS" tag 20
+create vlan "VOICE" tag 100
+
+# Link aggregation (sharing)
+enable sharing 10 grouping 10,9 algorithm address-based L3_L4 lacp
+
+# Port configuration
+# Port-channel1
+configure ports 10 description-string "LACP to server"
+configure vlan "USERS" add ports 10 tagged
+configure vlan "SERVERS" add ports 10 tagged
+configure ports 1 description-string "User port"
+configure vlan Default delete ports 1
+configure vlan "USERS" add ports 1 untagged
+configure ports 11 description-string "Printer"
+configure vlan Default delete ports 11
+configure vlan "SERVERS" add ports 11 untagged
+configure ports 12 description-string "UNUSED"
+disable ports 12
+configure ports 2 description-string "User port"
+configure vlan Default delete ports 2
+configure vlan "USERS" add ports 2 untagged
+configure ports 3 description-string "User port"
+configure vlan Default delete ports 3
+configure vlan "USERS" add ports 3 untagged
+configure ports 4 description-string "User port"
+configure vlan Default delete ports 4
+configure vlan "USERS" add ports 4 untagged
+configure ports 5 description-string "User port"
+configure vlan Default delete ports 5
+configure vlan "USERS" add ports 5 untagged
+configure ports 6 description-string "User port"
+configure vlan Default delete ports 6
+configure vlan "USERS" add ports 6 untagged
+configure ports 7 description-string "User port"
+configure vlan Default delete ports 7
+configure vlan "USERS" add ports 7 untagged
+configure ports 8 description-string "User port"
+configure vlan Default delete ports 8
+configure vlan "USERS" add ports 8 untagged
+configure ports {uplink-m1-p1} description-string "Uplink to core"
+configure vlan Default delete ports {uplink-m1-p1}
+configure vlan "USERS" add ports {uplink-m1-p1} untagged
+configure vlan "SERVERS" add ports {uplink-m1-p1} tagged
+configure vlan "VOICE" add ports {uplink-m1-p1} tagged

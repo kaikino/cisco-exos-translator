@@ -1,0 +1,48 @@
+# WARNINGS — review before deploying
+# Input (problems in the Cisco config):
+#   - ACL WARN-EXAMPLES: 5 rule(s) could not be translated; the generated ACL is incomplete -- review before applying
+# Not translated (7 line(s) outside this tool's L2 scope; review for anything you must port manually):
+#   - 'deny ip any any log' (line 58)
+#   - 'end' (line 75)
+#   - 'ip access-group 100 out' (line 67)
+#   - 'permit ip 10.1.0.0 0.0.255.0 any' (line 61)
+#   - 'permit tcp any any eq www' (line 59)
+#   - 'permit tcp any any established' (line 57)
+#   - 'permit tcp any gt 1023 any' (line 60)
+# Translation (decisions made converting to EXOS):
+#   - Vlan10: ACL SERVERS-IN applied to vlan "USERS" is stricter than the Cisco router ACL: EXOS also filters intra-VLAN (bridged) traffic, not just routed traffic
+#   - ACL 10: defined but not applied to any translated target; skipped
+#   - ACL MGMT: defined but not applied to any translated target; skipped
+#   - ACL WARN-EXAMPLES: defined but not applied to any translated target; skipped
+
+# Translation reference (from the mapping file; edit it and re-run to change)
+# VLANs (Cisco tag -> EXOS name):
+#   10 -> USERS
+# Ports (Cisco name -> EXOS port):
+#   GigabitEthernet1/0/1 -> 1
+#   GigabitEthernet1/0/2 -> 2
+#   GigabitEthernet1/0/3 -> 3
+
+# System
+configure snmp sysName "ACL-SAMPLES"
+
+# VLANs
+create vlan "USERS" tag 10
+
+# Port configuration
+configure vlan Default delete ports 1
+configure vlan "USERS" add ports 1 untagged
+configure vlan Default delete ports 2
+configure vlan "USERS" add ports 2 untagged
+configure vlan Default delete ports 3
+configure vlan "USERS" add ports 3 untagged
+
+# L3 (SVI addresses, routing)
+configure vlan "USERS" ipaddress 10.10.10.1/24
+enable ipforwarding vlan "USERS"
+
+# ACLs (policy files; upload each <name>.pol to the switch
+# BEFORE loading this script)
+configure access-list V_100 ports 2 ingress
+configure access-list SERVERS_IN ports 1 ingress
+configure access-list SERVERS_IN vlan "USERS" ingress

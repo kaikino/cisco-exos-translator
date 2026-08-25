@@ -6,6 +6,13 @@ from __future__ import annotations
 
 import re
 
+from .findings import (
+    FindingsCollector,
+    Severity,
+    SourceRef,
+    TranslationStatus,
+    WarningSink,
+)
 from .models import ParsedConfig, PhysicalInterface
 
 
@@ -53,14 +60,19 @@ RE_UPLINK = re.compile(r"\{uplink-m(\d+)-p(\d+)\}")
 # numbered right after the base ports, so module port P -> start + P - 1
 # explicit per-port edits already replaced their placeholder and are unaffected
 def _resolve_uplinks(
-    port_map: dict[str, str], uplinks: dict | None, warnings: list[str]
+    port_map: dict[str, str], uplinks: dict | None, sink: WarningSink
 ) -> None:
     start = (uplinks or {}).get("start")
     if start is None:
         return
     if not isinstance(start, int) or start < 1:
-        warnings.append(
-            f"mapping: uplinks.start '{start}' is not a positive integer; ignored"
+        sink.warn(
+            "mapping.invalid_uplink_start",
+            f"mapping: uplinks.start '{start}' is not a positive integer; ignored",
+            feature="port",
+            category="mapping",
+            reason="the mapping file value is not usable",
+            action="set uplinks.start to the first uplink port number on the target switch",
         )
         return
     for name, exos in port_map.items():
@@ -78,7 +90,7 @@ def _sanitize_vlan_name(name: str) -> str:
 
 
 # Map every VLAN id that must exist in EXOS (defined + referenced) to a name
-def _build_vlan_name_map(config: ParsedConfig, warnings: list[str]) -> dict[int, str]:
+def _build_vlan_name_map(config: ParsedConfig, sink: WarningSink) -> dict[int, str]:
     # Collect VLANs referenced by any port (access / trunk allowed / native)
     # or by an addressed SVI (its VLAN must exist to carry the IP)
     referenced: set[int] = set()
@@ -99,9 +111,17 @@ def _build_vlan_name_map(config: ParsedConfig, warnings: list[str]) -> dict[int,
     for vid in sorted(referenced - defined):
         if vid == 1:
             continue
-        warnings.append(
+        sink.warn(
+            "vlan.auto_created",
             f"VLAN {vid}: referenced by a port but never defined; "
-            f"auto-creating it in the EXOS output"
+            f"auto-creating it in the EXOS output",
+            feature="vlan",
+            status=TranslationStatus.ASSUMPTION_MADE,
+            object_name=f"VLAN {vid}",
+            reason="a port references the VLAN, so the .xsf would be invalid without it",
+            source=SourceRef(cisco_object=f"vlan {vid}"),
+            action=f"confirm VLAN {vid} should exist on the EXOS switch",
+            metadata={"vlan": vid},
         )
 
     name_map: dict[int, str] = {}
@@ -111,9 +131,15 @@ def _build_vlan_name_map(config: ParsedConfig, warnings: list[str]) -> dict[int,
         if vid == 1:
             v = config.vlans.get(1)
             if v and v.name and v.name.lower() != "default":
-                warnings.append(
+                sink.warn(
+                    "vlan.default_name_ignored",
                     f"VLAN 1: Cisco name '{v.name}' ignored; EXOS uses the "
-                    f"built-in Default VLAN for tag 1"
+                    f"built-in Default VLAN for tag 1",
+                    feature="vlan",
+                    status=TranslationStatus.ASSUMPTION_MADE,
+                    object_name="VLAN 1",
+                    reason="tag 1 maps to the EXOS built-in Default VLAN, which is not renamed",
+                    metadata={"vlan": 1, "cisco_name": v.name},
                 )
             name_map[1] = "Default"
             used_names.add("Default")
@@ -129,19 +155,33 @@ def _build_vlan_name_map(config: ParsedConfig, warnings: list[str]) -> dict[int,
 
 # Decide whether a bundle defaults to LACP (True) or static (False)
 # active/passive -> LACP, on -> static, auto/desirable -> PAgP (flagged, LACP)
-def _lacp_for_modes(po_id: int, modes: set[str], warnings: list[str]) -> bool:
+def _lacp_for_modes(po_id: int, modes: set[str], sink: WarningSink) -> bool:
     if modes & {"auto", "desirable"}:
-        warnings.append(
+        sink.warn(
+            "lag.pagp_defaulted_to_lacp",
             f"Port-channel{po_id}: PAgP mode(s) {sorted(modes & {'auto', 'desirable'})} "
-            f"have no EXOS equivalent; defaulting to LACP (override via the mapping file)"
+            f"have no EXOS equivalent; defaulting to LACP (override via the mapping file)",
+            feature="lag",
+            status=TranslationStatus.ASSUMPTION_MADE,
+            object_name=f"Port-channel{po_id}",
+            reason="EXOS sharing supports LACP or static only",
+            action="confirm the peer runs LACP, or set the LAG to 'static' in the mapping file",
+            metadata={"cisco_modes": sorted(modes)},
         )
         return True
     if modes == {"on"}:
         return False  # static bundle
     if "on" in modes and modes & {"active", "passive"}:
-        warnings.append(
+        sink.warn(
+            "lag.mixed_modes",
             f"Port-channel{po_id}: mixed static ('on') and LACP member modes; "
-            f"defaulting to LACP"
+            f"defaulting to LACP",
+            feature="lag",
+            status=TranslationStatus.ASSUMPTION_MADE,
+            object_name=f"Port-channel{po_id}",
+            reason="the bundle's members disagree; one EXOS sharing mode must be chosen",
+            action="confirm the intended aggregation mode for this bundle",
+            metadata={"cisco_modes": sorted(modes)},
         )
     return True
 
@@ -159,7 +199,7 @@ def _member_modes(config: ParsedConfig, po) -> set[str]:
 # build the default translation mapping: every decision the user may override
 def build_default_mapping(config: ParsedConfig) -> dict:
     stacked = len(config.stack_members) > 1
-    throwaway: list[str] = []  # warnings re-raised at generation time
+    throwaway = WarningSink()  # warnings re-raised at generation time
 
     vlans = {
         str(vid): name
@@ -222,7 +262,7 @@ def _untagged_lines(port: str, vid: int, vlan_names: dict[int, str]) -> list[str
 # Render a port's switchport mode as EXOS "add ports" lines
 # access -> untagged on the access VLAN; trunk -> native untagged, rest tagged
 def _membership_lines(
-    port: str, iface, vlan_names: dict[int, str], warnings: list[str]
+    port: str, iface, vlan_names: dict[int, str], sink: WarningSink
 ) -> list[str]:
     lines: list[str] = []
 
@@ -244,10 +284,21 @@ def _membership_lines(
         allowed = iface.trunk_allowed_vlans
         if not allowed:
             allowed = {vid for vid in vlan_names if vid != 1}
-            warnings.append(
+            sink.warn(
+                "trunk.expanded_all_vlans",
                 f"{iface.canonical_name}: trunk has no allowed-VLAN list (Cisco "
                 f"carries all VLANs); expanded to all {len(allowed)} non-Default "
-                f"VLANs defined on this switch"
+                f"VLANs defined on this switch",
+                feature="port",
+                status=TranslationStatus.ASSUMPTION_MADE,
+                object_name=iface.canonical_name,
+                reason="Cisco trunks carry every VLAN by default; EXOS membership is explicit",
+                source=SourceRef(
+                    cisco_object=iface.canonical_name,
+                    line=iface.source_lines[0] if iface.source_lines else None,
+                ),
+                action="prune the VLAN list on this trunk if it should not carry all of them",
+                metadata={"expanded_vlans": sorted(allowed)},
             )
 
         for vid in sorted(allowed):
@@ -400,23 +451,40 @@ def generate_exos_config(
     config: ParsedConfig,
     mapping: dict | None = None,
     mapping_notes: list[str] | None = None,
+    collector: FindingsCollector | None = None,
 ) -> tuple[str, list[str], dict[str, str]]:
     # Returns the .xsf text, the translation warnings, and the ACL policy
     # files as {policy_name: .pol content} (empty when the config has no
-    # applied ACLs)
-    warnings: list[str] = list(mapping_notes or [])
+    # applied ACLs). When a collector is supplied, every warning is also
+    # recorded as a structured finding.
+    sink = WarningSink(collector, category="translation")
+    for note in mapping_notes or []:
+        sink.warn(
+            "mapping.note",
+            note,
+            feature="mapping",
+            category="mapping",
+            severity=Severity.INFO,
+            reason="difference between the mapping file and the current Cisco config",
+        )
     out: list[str] = []
 
     if mapping is None:
         mapping = build_default_mapping(config)
 
     # vlan names: rebuild defaults for their warnings, then mapping values win
-    vlan_names = _build_vlan_name_map(config, warnings)
+    vlan_names = _build_vlan_name_map(config, sink)
     for key, name in (mapping.get("vlans") or {}).items():
         try:
             vid = int(key)
         except ValueError:
-            warnings.append(f"mapping: VLAN key '{key}' is not a number; ignored")
+            sink.warn(
+                "mapping.bad_vlan_key",
+                f"mapping: VLAN key '{key}' is not a number; ignored",
+                feature="vlan",
+                category="mapping",
+                reason="VLAN keys in the mapping file must be numeric Cisco tags",
+            )
             continue
         if vid in vlan_names:
             vlan_names[vid] = name
@@ -424,30 +492,56 @@ def generate_exos_config(
     # port names come from the mapping; resolve uplink placeholders through the
     # uplink rule, then validate what is left in place
     port_map: dict[str, str] = dict(mapping.get("ports") or {})
-    _resolve_uplinks(port_map, mapping.get("uplinks"), warnings)
+    _resolve_uplinks(port_map, mapping.get("uplinks"), sink)
     collisions: dict[str, list[str]] = {}
     for name, exos in sorted(port_map.items()):
         iface = config.interfaces.get(name)
         if getattr(iface, "mode", None) == "routed":
             continue  # excluded from output anyway
         if "{uplink" in exos:
-            warnings.append(
+            sink.warn(
+                "port.unresolved_uplink",
                 f"{name}: unresolved uplink placeholder '{exos}'; set "
                 f"uplinks.start in the mapping file (first uplink port number) "
-                f"or replace this port entry individually"
+                f"or replace this port entry individually",
+                feature="port",
+                status=TranslationStatus.PARTIALLY_TRANSLATED,
+                severity=Severity.ERROR,
+                object_name=name,
+                reason="uplink-module ports have no platform-independent EXOS port number",
+                source=SourceRef(cisco_object=name),
+                output_ref=exos,
+                action="replace the placeholder with the real EXOS port before deploying",
             )
         elif exos == name:
-            warnings.append(
+            sink.warn(
+                "port.no_exos_number",
                 f"{name}: could not derive an EXOS port number; emitted the "
-                f"name verbatim -- correct it in the mapping file"
+                f"name verbatim -- correct it in the mapping file",
+                feature="port",
+                status=TranslationStatus.PARTIALLY_TRANSLATED,
+                severity=Severity.ERROR,
+                object_name=name,
+                reason="the Cisco interface name did not parse into stack/module/port",
+                source=SourceRef(cisco_object=name),
+                action="set the EXOS port for this interface in the mapping file",
             )
         collisions.setdefault(exos, []).append(name)
     for exos, sources in sorted(collisions.items()):
         if len(sources) > 1:
-            warnings.append(
+            sink.warn(
+                "port.collision",
                 f"EXOS port '{exos}' is the target of multiple Cisco interfaces "
                 f"({', '.join(sources)}); their config is merged and almost "
-                f"certainly wrong -- assign distinct ports in the mapping file"
+                f"certainly wrong -- assign distinct ports in the mapping file",
+                feature="port",
+                status=TranslationStatus.ERROR,
+                severity=Severity.ERROR,
+                object_name=exos,
+                reason="two Cisco interfaces resolved to the same EXOS port",
+                output_ref=exos,
+                action="assign distinct EXOS ports in the mapping file and re-run",
+                metadata={"cisco_interfaces": sources},
             )
 
     # resolve each LAG once: master (mapping wins), member ports, lacp/static
@@ -455,28 +549,44 @@ def generate_exos_config(
     lag_map: dict[int, tuple[str, list[str], bool]] = {}
     for po_id, po in sorted(config.port_channels.items()):
         if not po.members:
-            warnings.append(
-                f"Port-channel{po_id}: no member ports; skipped in EXOS output"
+            sink.warn(
+                "lag.skipped_no_members",
+                f"Port-channel{po_id}: no member ports; skipped in EXOS output",
+                feature="lag",
+                status=TranslationStatus.UNSUPPORTED,
+                object_name=f"Port-channel{po_id}",
+                reason="an EXOS sharing group needs at least one member port",
+                source=SourceRef(cisco_object=f"Port-channel{po_id}"),
             )
             continue
         member_ports = [port_map[m] for m in sorted(po.members) if m in port_map]
         if not member_ports:
             continue
-        default_lacp = _lacp_for_modes(po_id, _member_modes(config, po), warnings)
+        default_lacp = _lacp_for_modes(po_id, _member_modes(config, po), sink)
 
         entry = lag_settings.get(f"Port-channel{po_id}") or {}
         master = entry.get("master") or member_ports[0]
         if master not in member_ports:
-            warnings.append(
+            sink.warn(
+                "mapping.bad_lag_master",
                 f"Port-channel{po_id}: mapping master '{master}' is not one of "
-                f"the member ports; using '{member_ports[0]}'"
+                f"the member ports; using '{member_ports[0]}'",
+                feature="lag",
+                category="mapping",
+                object_name=f"Port-channel{po_id}",
+                reason="the EXOS sharing master must be one of the grouped ports",
             )
             master = member_ports[0]
         mode = entry.get("mode")
         if mode not in (None, "lacp", "static"):
-            warnings.append(
+            sink.warn(
+                "mapping.bad_lag_mode",
                 f"Port-channel{po_id}: mapping mode '{mode}' is not "
-                f"'lacp'/'static'; using the derived default"
+                f"'lacp'/'static'; using the derived default",
+                feature="lag",
+                category="mapping",
+                object_name=f"Port-channel{po_id}",
+                reason="only 'lacp' and 'static' are valid mapping modes",
             )
             mode = None
         lacp = default_lacp if mode is None else (mode == "lacp")
@@ -499,10 +609,17 @@ def generate_exos_config(
         out.append("# Stacking (review: EXOS stacking is configured on-hardware)")
         for member_id, member in sorted(config.stack_members.items()):
             if member.provision_model:
-                warnings.append(
+                sink.warn(
+                    "stack.model_not_mappable",
                     f"Stack member {member_id}: Cisco model "
                     f"'{member.provision_model}' cannot be mapped to an EXOS "
-                    f"slot type; configure the stack slot on the EXOS hardware"
+                    f"slot type; configure the stack slot on the EXOS hardware",
+                    feature="stack",
+                    status=TranslationStatus.UNSUPPORTED,
+                    object_name=f"switch {member_id}",
+                    reason="EXOS slot types are hardware-specific and set on the switch",
+                    action="bring the stack up on the hardware before loading the .xsf",
+                    metadata={"cisco_model": member.provision_model},
                 )
                 out.append(f"#   slot {member_id}: was '{member.provision_model}'")
             if member.priority is not None:
@@ -541,7 +658,7 @@ def generate_exos_config(
         out.append(f"# Port-channel{po_id}")
         if po.description:
             out.append(f'configure ports {master} description-string "{po.description}"')
-        out.extend(_membership_lines(master, po, vlan_names, warnings))
+        out.extend(_membership_lines(master, po, vlan_names, sink))
         if po.shutdown:
             out.append(f"disable ports {master}")
 
@@ -560,20 +677,42 @@ def generate_exos_config(
         if _is_svi(iface):
             # addressed SVIs are handled by the L3 section below
             if not iface.ip_address:
-                warnings.append(f"{name}: SVI with no IP address; skipped")
+                sink.warn(
+                    "svi.no_address",
+                    f"{name}: SVI with no IP address; skipped",
+                    feature="l3",
+                    status=TranslationStatus.UNSUPPORTED,
+                    severity=Severity.INFO,
+                    object_name=name,
+                    reason="an SVI without an address produces no EXOS output",
+                    source=SourceRef(cisco_object=name),
+                )
             continue
         if iface.mode == "routed":
-            warnings.append(
-                f"{name}: routed (L3) interface is out of L2 scope; skipped"
+            # validation already recorded this interface as out of scope
+            sink.warn(
+                "interface.routed_skipped",
+                f"{name}: routed (L3) interface is out of L2 scope; skipped",
+                record=False,
             )
             out.append(f"# {name}: routed interface skipped (L3, out of scope)")
             continue
         if name not in port_map:
-            warnings.append(f"{name}: no port mapping entry; skipped")
+            sink.warn(
+                "port.no_mapping_entry",
+                f"{name}: no port mapping entry; skipped",
+                feature="port",
+                status=TranslationStatus.UNSUPPORTED,
+                severity=Severity.ERROR,
+                object_name=name,
+                reason="the mapping file has no EXOS port for this interface",
+                source=SourceRef(cisco_object=name),
+                action="add a ports entry for this interface in the mapping file",
+            )
             continue
 
         port = port_map[name]
-        membership = _membership_lines(port, iface, vlan_names, warnings)
+        membership = _membership_lines(port, iface, vlan_names, sink)
 
         # Skip ports with nothing to configure
         if not (iface.description or membership or iface.shutdown):
@@ -594,7 +733,16 @@ def generate_exos_config(
         if vid is None or vid not in vlan_names:
             continue
         if iface.shutdown:
-            warnings.append(f"{name}: SVI is shutdown; L3 config not emitted")
+            sink.warn(
+                "svi.shutdown",
+                f"{name}: SVI is shutdown; L3 config not emitted",
+                feature="l3",
+                status=TranslationStatus.UNSUPPORTED,
+                object_name=name,
+                reason="the source SVI is administratively down",
+                source=SourceRef(cisco_object=name),
+                action="enable and configure the VLAN IP on EXOS if it is needed",
+            )
             continue
         vlan = "Default" if vid == 1 else f'"{vlan_names[vid]}"'
         l3_lines.append(f"configure vlan {vlan} ipaddress {iface.ip_address}")
@@ -620,25 +768,46 @@ def generate_exos_config(
             if _is_svi(iface):
                 vid = _svi_vlan_id(iface)
                 if vid is None or vid not in vlan_names:
-                    warnings.append(
+                    sink.warn(
+                        "acl.svi_vlan_missing",
                         f"{name}: ACL {acl} is a router ACL but the SVI's VLAN "
-                        f"is not in the output; not applied"
+                        f"is not in the output; not applied",
+                        feature="acl",
+                        status=TranslationStatus.UNSUPPORTED,
+                        severity=Severity.ERROR,
+                        object_name=acl,
+                        reason="the ACL's target VLAN does not exist in the EXOS output",
+                        source=SourceRef(cisco_object=name),
                     )
                     continue
                 vlan = "Default" if vid == 1 else f'"{vlan_names[vid]}"'
                 applied.setdefault(acl, []).append(f"vlan {vlan}")
                 # EXOS VLAN ACLs also filter bridged intra-VLAN traffic, which
                 # a Cisco router ACL never touches
-                warnings.append(
+                sink.warn(
+                    "acl.router_acl_widened",
                     f"{name}: ACL {acl} applied to vlan {vlan} is stricter than "
                     f"the Cisco router ACL: EXOS also filters intra-VLAN "
-                    f"(bridged) traffic, not just routed traffic"
+                    f"(bridged) traffic, not just routed traffic",
+                    feature="acl",
+                    status=TranslationStatus.PARTIALLY_TRANSLATED,
+                    object_name=acl,
+                    reason="EXOS applies a VLAN ACL to bridged traffic as well as routed",
+                    source=SourceRef(cisco_object=name),
+                    output_ref=f"{acl} -> vlan {vlan}",
+                    action="verify intra-VLAN traffic is not broken by the wider match",
                 )
                 continue
             if iface.mode == "routed":
-                warnings.append(
+                sink.warn(
+                    "acl.on_routed_port",
                     f"{name}: ACL {acl} on a routed physical port; not "
-                    f"translated (routed ports are out of scope)"
+                    f"translated (routed ports are out of scope)",
+                    feature="acl",
+                    status=TranslationStatus.UNSUPPORTED,
+                    object_name=acl,
+                    reason="routed physical ports are outside the translator's scope",
+                    source=SourceRef(cisco_object=name),
                 )
                 continue
             if name in bundled:
@@ -654,8 +823,15 @@ def generate_exos_config(
                 applied.setdefault(acl, []).append(f"ports {lag_map[po_id][0]}")
 
     for acl in sorted(set(config.acls) - set(applied)):
-        warnings.append(
-            f"ACL {acl}: defined but not applied to any translated target; skipped"
+        sink.warn(
+            "acl.defined_not_applied",
+            f"ACL {acl}: defined but not applied to any translated target; skipped",
+            feature="acl",
+            status=TranslationStatus.UNSUPPORTED,
+            severity=Severity.INFO,
+            object_name=acl,
+            reason="no translated interface references this ACL with 'ip access-group ... in'",
+            source=SourceRef(cisco_object=acl),
         )
     pol_files: dict[str, str] = {}  # policy name -> .pol file content
     if applied:
@@ -665,9 +841,17 @@ def generate_exos_config(
     for acl, targets in sorted(applied.items()):
         rules = config.acls.get(acl)
         if not rules:
-            warnings.append(
+            sink.warn(
+                "acl.referenced_undefined",
                 f"ACL {acl}: referenced by 'ip access-group' but never defined; "
-                f"not applied"
+                f"not applied",
+                feature="acl",
+                status=TranslationStatus.ERROR,
+                severity=Severity.ERROR,
+                object_name=acl,
+                reason="the Cisco config applies an ACL it never defines",
+                source=SourceRef(cisco_object=acl),
+                action="supply the missing ACL, or remove the reference",
             )
             continue
         # policy name must equal the .pol basename; reuse the VLAN name rules
@@ -684,19 +868,19 @@ def generate_exos_config(
     # Cisco config, lines dropped as untranslatable, and translation decisions
     input_warnings = config.warnings
     unsupported = _unsupported_summary(config)
-    if input_warnings or unsupported or warnings:
+    if input_warnings or unsupported or sink.messages:
         banner = ["# WARNINGS — review before deploying"]
         if input_warnings:
             banner.append("# Input (problems in the Cisco config):")
             banner.extend(f"#   - {w}" for w in input_warnings)
         banner.extend(unsupported)
-        if warnings:
+        if sink.messages:
             banner.append("# Translation (decisions made converting to EXOS):")
-            banner.extend(f"#   - {w}" for w in warnings)
+            banner.extend(f"#   - {w}" for w in sink.messages)
         banner.append("")
         out = banner + out
 
-    return "\n".join(out) + "\n", warnings, pol_files
+    return "\n".join(out) + "\n", sink.messages, pol_files
 
 
 # Stack bring-up runbook for configs with 2+ stack members

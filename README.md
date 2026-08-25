@@ -13,7 +13,16 @@ in, one EXOS `.xsf` out. There is no multi-switch topology correlation.
 python3 main.py <cisco_config.cfg> [<cisco_config2.cfg> ...]
 ```
 
-For each input, writes two files alongside it:
+Options:
+
+| Flag | Effect |
+|---|---|
+| `-o DIR`, `--output-dir DIR` | write every artifact into `DIR` instead of next to each input (names are unchanged) |
+| `--no-findings` | skip the `<name>.findings.json` artifact |
+| `--ai-summary` | additionally generate `<name>.migration-report.md` from the findings (opt-in; see [AI migration report](#ai-migration-report-optional)) |
+| `--ai-model MODEL` | model id for `--ai-summary` (default: `$EXOS_TRANSLATOR_AI_MODEL`, else `claude-opus-5`) |
+
+For each input, writes alongside it:
 
 - **`<name>.map.json`** — the translation mapping (VLAN names, Cisco→EXOS port
   numbers, uplink rule, LAG master/mode). Written with derived defaults on the
@@ -31,6 +40,13 @@ For each input, writes two files alongside it:
   `ip access-group ... in`) — one EXOS policy file per ACL. Upload them to the
   switch (`tftp put ...`) **before** loading the `.xsf`, which applies them by
   name.
+- **`<name>.findings.json`** — the structured migration findings: what
+  translated, what did not, and every assumption the translator made. Produced
+  by the deterministic pipeline, with no AI involved, on every run unless
+  `--no-findings` is given. See [Migration findings](#migration-findings).
+- **`<name>.migration-report.md`** (only with `--ai-summary`) — a human-readable
+  migration summary written by an LLM **from the findings file**. Explanatory
+  only; never deployable configuration.
 - **`<name>.stack-setup.txt`** (only when the source config has 2+ stack
   members) — the stack bring-up runbook. EXOS stacking is a mode change with
   per-node reboots and a fresh config context, so it cannot be part of the
@@ -62,10 +78,22 @@ python3 main.py sw1.cfg     # 2nd run: regenerates sw1.xsf with your edits
 running-config text
   → scanner     (text  → structured blocks)
   → parser      (blocks → ParsedConfig IR)
-  → validation  (cross-reference checks → warnings)
+  → validation  (cross-reference checks → warnings + findings)
   → mapping     (derived defaults ⊕ user-edited <name>.map.json)
-  → generator   (ParsedConfig + mapping → EXOS .xsf)
+  → generator   (ParsedConfig + mapping → EXOS .xsf + warnings + findings)
+  → findings    (collected findings + scope classification → <name>.findings.json)
+  → ai summary  (findings → <name>.migration-report.md)          [opt-in]
 ```
+
+Warnings and findings come from one pipeline, not two: each stage emits its
+warning text through a `WarningSink`, which appends the message to the `.xsf`
+banner and — when a `FindingsCollector` is attached — records the structured
+finding for the same event. The collector is passed explicitly into each stage;
+there is no global state, and the translation itself never depends on it.
+
+The AI step is the last one, runs only with `--ai-summary`, and consumes the
+findings document. It cannot influence the `.xsf`, the `.pol` files, or the
+findings.
 
 ## Supported translations
 
@@ -128,6 +156,229 @@ Embedded as `#` comments at the top of each `.xsf`:
   Mixed static (`on`) + LACP member modes are also flagged.
 - **Routed (L3) interfaces** — skipped.
 
+## Migration findings
+
+`<name>.findings.json` is the machine-readable record of the translation. It is
+produced by the deterministic pipeline — **no AI service is involved and none is
+required** — and is written on every run unless `--no-findings` is given.
+
+### Statuses and severities
+
+Translation status and severity are separate fields, because they answer
+different questions. Status is *what happened to this Cisco construct*;
+severity is *how much it should worry you*. A VLAN auto-created because a port
+referenced it is `assumption_made` **and** `warning`.
+
+| `status` | Meaning |
+|---|---|
+| `translated` | emitted to the `.xsf` (or `.pol`) as intended |
+| `partially_translated` | only part of the Cisco behaviour is represented — e.g. an ACL with rules the parser rejected, or a port left as an uplink placeholder |
+| `unsupported` | recognised, but no EXOS translation is implemented — nothing was emitted |
+| `assumption_made` | a default, inferred value or broad interpretation was used (trunk expanded to all VLANs, VLAN auto-created, PAgP defaulted to LACP) |
+| `warning` | an input-validity or mapping-file problem that is not itself a translation outcome |
+| `error` | invalid or self-contradictory source that produces wrong output (an ACL applied but never defined, two interfaces on one EXOS port) |
+
+| `severity` | Meaning |
+|---|---|
+| `info` | for the record; no action expected |
+| `warning` | review before deploying |
+| `error` | the output is wrong or incomplete until you act |
+
+`summary` counts the first four statuses, plus warnings and errors *by
+severity*, so the six numbers deliberately do **not** sum to `total_findings`.
+
+Successful low-level operations are not each turned into a finding: `translated`
+findings are one per feature area (VLANs, ports, LAGs, ACLs, L3, hostname) with
+counts and object lists in `metadata`. Untranslated source lines are grouped by
+command, so a 48-port config with `spanning-tree portfast` everywhere produces
+one finding with `metadata.occurrences: 48`, not 48 findings.
+
+### Where classification lives
+
+`cisco_exos_translator/feature_support.py` holds an ordered list of
+`FeatureRule`s (regex → feature name, status, reason, suggested action). That is
+the single place to extend feature coverage — from inside the module or via
+`register_feature()` — instead of adding special cases to the parser or
+generator. Anything unmatched falls through to `unsupported` with a generic
+reason, so nothing is silently classified as fine.
+
+### Sample findings JSON
+
+Trimmed from `python3 main.py demo.cfg`:
+
+```json
+{
+  "schema_version": "1.0",
+  "translator_version": "0.1.0",
+  "input": {
+    "filename": "demo.cfg",
+    "sha256": "4638a09a05115cd5a7507f8d002866652745b0b6083d9534b7cfa7992820c6dd",
+    "line_count": 50,
+    "hostname": "SW-DEMO-01"
+  },
+  "summary": {
+    "translated": 4, "partially_translated": 1, "unsupported": 6,
+    "assumptions": 0, "warnings": 6, "errors": 1, "total_findings": 11
+  },
+  "findings": [
+    {
+      "id": "port.unresolved_uplink#1",
+      "code": "port.unresolved_uplink",
+      "category": "translation",
+      "feature": "port",
+      "status": "partially_translated",
+      "severity": "error",
+      "message": "TenGigabitEthernet1/1/1: unresolved uplink placeholder '{uplink-m1-p1}'; set uplinks.start in the mapping file (first uplink port number) or replace this port entry individually",
+      "object": "TenGigabitEthernet1/1/1",
+      "reason": "uplink-module ports have no platform-independent EXOS port number",
+      "source": { "cisco_object": "TenGigabitEthernet1/1/1" },
+      "output_ref": "{uplink-m1-p1}",
+      "action": "replace the placeholder with the real EXOS port before deploying"
+    },
+    {
+      "id": "unsupported.storm-control#1",
+      "code": "unsupported.storm-control",
+      "category": "scope",
+      "feature": "storm-control",
+      "status": "unsupported",
+      "severity": "warning",
+      "message": "'storm-control broadcast level 5.00' (8 line(s)) has no EXOS output: storm control is not translated",
+      "object": "storm-control broadcast level 5.00",
+      "reason": "storm control is not translated",
+      "source": { "lines": [21], "block": "interface range GigabitEthernet1/0/1-8" },
+      "action": "review EXOS rate-limit / flood-control for the same ports",
+      "metadata": { "occurrences": 8, "parser_reasons": ["unsupported or unhandled interface command"] }
+    }
+  ],
+  "artifacts": {
+    "exos_config": "demo.xsf",
+    "mapping": "demo.map.json",
+    "acl_policies": [],
+    "stack_setup": null,
+    "findings": "demo.findings.json",
+    "migration_report": null
+  },
+  "generation": {
+    "status": "completed_with_errors",
+    "translation": "deterministic",
+    "ai_report": { "requested": false, "status": "disabled" }
+  }
+}
+```
+
+Artifact references are **basenames only** — no local filesystem paths — and no
+environment variables, API keys or credentials are ever written to the file.
+
+## AI migration report (optional)
+
+`--ai-summary` sends the findings document to an LLM and writes
+`<name>.migration-report.md`. The AI is **explanatory only**: it is instructed to
+use nothing but the supplied findings, never to write or correct EXOS
+configuration, and never to claim an unsupported feature has an EXOS equivalent
+unless the finding's own `action` field says so. Its output is not deployable
+configuration, and the generated file says so in a comment at the top.
+
+### Configuration
+
+| Requirement | How |
+|---|---|
+| SDK | `pip install anthropic` — an **optional** dependency; the translator is stdlib-only without it |
+| Credentials | resolved by the SDK from the environment (`ANTHROPIC_API_KEY`, or an `ant auth login` profile). The translator never reads, logs or serialises their value |
+| Model | `--ai-model`, else `$EXOS_TRANSLATOR_AI_MODEL`, else `claude-opus-5` |
+
+`cisco_exos_translator/ai.py` is the only module that talks to a provider:
+`LLMClient` (interface) → `AnthropicLLMClient` (the one implementation) →
+`MigrationSummaryGenerator.generate_summary(findings_document) -> str`. Swapping
+providers means adding a class next to `AnthropicLLMClient`; nothing else in the
+codebase imports the SDK, and `ai.py` is imported only when `--ai-summary` is
+passed.
+
+The prompt asks the model for, in order: **1.** executive summary,
+**2.** successfully translated areas, **3.** unsupported items, **4.** partially
+translated items, **5.** assumptions made, **6.** manual review requirements,
+**7.** recommended validation steps.
+
+### Privacy
+
+- AI summary generation is **opt-in**; nothing leaves the machine without
+  `--ai-summary`.
+- What is sent: **the findings JSON only**, minus its `generation` block. The
+  Cisco running-config file and the generated EXOS config are **not** sent.
+  Every run prints a one-line disclosure to stderr before the request.
+- **Findings still contain customer-specific data** — hostnames, interface
+  descriptions, VLAN names, IP addresses, ACL source/destination prefixes, the
+  resulting topology, and the **verbatim text of every Cisco command that could
+  not be translated** (that quoting is the point of an `unsupported` finding).
+  Treat sending them as you would treat sending the config itself.
+- Lines the feature registry marks as credential-bearing (`username`,
+  `enable secret`, `snmp-server community`, RADIUS/TACACS+ keys) are reduced to
+  their command keyword before being recorded, so the secret never reaches the
+  findings file. **This is not a general secret scanner** — it covers only the
+  patterns listed in `feature_support.py`, and nothing else scans the config for
+  secrets. Review the findings file before sending it anywhere.
+- Raw configuration content is never printed to the console or to logs.
+
+### Failure behaviour
+
+The AI step runs *after* the `.xsf`, `.pol` and stack-setup files are on disk,
+and its result is only recorded in the findings document. If the SDK is missing,
+credentials are rejected, the model is unavailable, the request fails, or the
+model declines:
+
+- a clear `Warning: AI summary not generated: ...` goes to stderr,
+- no `.migration-report.md` is written,
+- the `.xsf`, `.pol`, mapping and `.findings.json` files are complete and
+  unchanged,
+- `generation.ai_report` in the findings records `"status": "failed"` plus the
+  error message,
+- the exit code stays `0` — the translation itself succeeded. A pipeline that
+  must react to the failure should check `generation.ai_report.status`.
+
+### Sample migration report
+
+Illustrative of the shape (the headings are fixed by the prompt; the prose is
+the model's):
+
+```markdown
+## Executive summary
+
+SW-DEMO-01 translated to EXOS with 4 feature areas converted, 1 item partially
+translated and 6 unsupported. One error-severity item must be resolved before
+the script can be loaded.
+
+## Successfully translated areas
+
+- 3 VLANs created (10 → USERS, 20 → VOICE, 30 → MGMT).
+- 12 access/trunk ports mapped with their VLAN membership.
+- 1 link aggregation group converted to EXOS sharing.
+
+## Unsupported items
+
+- `storm-control broadcast level 5.00` (8 occurrences) — storm control is not
+  translated. Recommended action from the findings: review EXOS rate-limit /
+  flood-control for the same ports.
+- `spanning-tree portfast` (9 occurrences) — spanning tree is not translated;
+  an EXOS STP mode must be chosen explicitly. The findings supply no equivalent
+  command.
+```
+
+## Testing
+
+Stdlib `unittest`; no third-party test runner, no network access, no AI
+credentials:
+
+```bash
+python3 -m unittest discover -s tests -t .
+```
+
+Covered: findings serialisation and schema shape, classification of each
+status, deterministic ordering and de-duplication, summary-count accuracy,
+byte-for-byte stability of the `.xsf`/`.pol` output against committed fixtures
+(`tests/fixtures/`), translation with AI disabled, artifact integrity when the
+AI provider fails, AI summary generation through a mocked client, that no
+credential reaches an artifact or the console, and output naming for single and
+multiple inputs with and without `--output-dir`.
+
 ## Not supported (out of scope)
 
 - **Layer 3 beyond the basics**: SVI IPv4 addresses and static IP routes are
@@ -163,8 +414,13 @@ cisco_exos_translator/
   scanner.py                    running-config text → ConfigBlocks
   parser.py                     ConfigBlocks → ParsedConfig IR
   models.py                     dataclasses (Vlan, interfaces, ParsedConfig, ...)
-  validation.py                 cross-reference checks (warnings)
+  validation.py                 cross-reference checks (warnings + findings)
   mapping.py                    .map.json read/write/merge
   generator.py                  ParsedConfig + mapping → EXOS .xsf
   helpers.py                    VLAN list / interface name parsing
+  findings.py                   Finding/status/severity model, collector, JSON doc
+  feature_support.py            Cisco feature → support status registry
+  findings_builder.py           collected findings → <name>.findings.json
+  ai.py                         optional LLM migration report (opt-in)
+tests/                          unittest suite + .xsf/.pol golden fixtures
 ```

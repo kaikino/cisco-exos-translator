@@ -78,3 +78,38 @@ exit                                   (answer N to "save configuration?")
 Every generated construct was accepted by `check policy`, compiled into TCAM
 on apply, and the switch's parsed view matched the Cisco source rule-for-rule.
 The .pol ACL path is hardware-validated at the configuration level.
+
+---
+
+# Follow-up: RACL (VLAN-applied ACL) hardware test — 2026-08-12
+
+Same switch, same generated outputs, after the RACL-to-VLAN feature landed.
+Full integrated flow from the .xsf: VLAN + port memberships + L3 (SVI address,
+ipforwarding) + PACLs + RACL together.
+
+```
+(upload SERVERS_IN.pol / V_100.pol as above; check policy -> successful)
+
+create vlan "USERS" tag 10
+configure vlan Default delete ports 1     (and 2, 3)
+configure vlan "USERS" add ports 1 untagged   (and 2, 3)
+configure vlan "USERS" ipaddress 10.10.10.1/24
+enable ipforwarding vlan "USERS"
+configure access-list V_100 ports 2 ingress          -> done!
+configure access-list SERVERS_IN ports 1 ingress     -> done!
+configure access-list SERVERS_IN vlan "USERS" ingress -> done!
+
+show access-list
+    Port 1        SERVERS_IN  ingress  5     (PACL)
+    Port 2        V_100       ingress  5     (PACL)
+    USERS  *      SERVERS_IN  ingress  5     (RACL -> VLAN-applied)
+show vlan | include USERS
+    USERS 10 10.10.10.1/24  -f-  0/3         (addressed, forwarding on)
+```
+
+Notable: the same .pol (SERVERS_IN) bound to a port and a VLAN simultaneously
+with no conflict — matching Cisco's reuse of one ACL on multiple targets.
+
+Cleanup (nothing saved): unconfigure both access-lists, delete vlan USERS,
+re-add ports 1-3 to Default, restore sysName, rm both .pol files.
+show access-list -> "No entry found!"; Default back to 0/16.

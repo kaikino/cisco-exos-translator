@@ -1,0 +1,42 @@
+# translated from Cisco ACL SERVERS-IN
+# Allow web and ssh to servers
+entry r10 {
+    if {
+        protocol tcp;
+        destination-address 10.2.0.5/32;
+        destination-port 22;
+    } then {
+        permit;
+    }
+}
+entry r20 {
+    if {
+        protocol tcp;
+        source-address 10.1.0.0/24;
+        destination-address 10.2.0.5/32;
+        destination-port 8000 - 8080;
+    } then {
+        permit;
+    }
+}
+entry r30 {
+    if {
+        protocol 47;
+    } then {
+        permit;
+    }
+}
+entry r40 {
+    if {
+    } then {
+        deny;
+    }
+}
+# Cisco implicit deny (IPv4 only)
+entry implicit_deny {
+    if {
+        source-address 0.0.0.0/0;
+    } then {
+        deny;
+    }
+}

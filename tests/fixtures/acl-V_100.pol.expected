@@ -1,0 +1,40 @@
+# translated from Cisco ACL 100
+entry r10 {
+    if {
+        protocol tcp;
+        source-address 10.1.0.0/24;
+        destination-port 443;
+    } then {
+        permit;
+    }
+}
+entry r20 {
+    if {
+        protocol udp;
+        destination-address 10.2.0.10/32;
+        destination-port 5000 - 5100;
+    } then {
+        permit;
+    }
+}
+entry r30 {
+    if {
+        protocol icmp;
+    } then {
+        permit;
+    }
+}
+entry r40 {
+    if {
+    } then {
+        deny;
+    }
+}
+# Cisco implicit deny (IPv4 only)
+entry implicit_deny {
+    if {
+        source-address 0.0.0.0/0;
+    } then {
+        deny;
+    }
+}
