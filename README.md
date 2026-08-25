@@ -16,7 +16,7 @@ python3 main.py <cisco_config.cfg> [<cisco_config2.cfg> ...]
 For each input, writes two files alongside it:
 
 - **`<name>.map.json`** — the translation mapping (VLAN names, Cisco→EXOS port
-  numbers, uplink rule, LAG master/mode). Written with derived defaults on the
+  numbers, uplink rule, LAG master/mode, SPAN-session→mirror-instance names). Written with derived defaults on the
   first run and never overwritten after that. Edit it and re-run to customize
   the translation. Your entries override the defaults; entries for interfaces
   no longer in the config are ignored (warned), and new interfaces fall back
@@ -89,6 +89,8 @@ running-config text
 | IPv4 ACLs (numbered & named, standard & extended) + `ip access-group <name> in` | one policy file (`<name>-acls/<ACL>.pol`) per applied ACL — entries in ACE order, `remark` kept as `#` comments, trailing deny-all (EXOS permits unmatched traffic by default) — applied via `configure access-list <ACL> ports <p> ingress`; upload the `.pol` files before loading the `.xsf` |
 | `interface VlanN` + `ip address A MASK` (SVI) | `configure vlan "<name>" ipaddress A/len` + `enable ipforwarding vlan "<name>"` (SVI-only VLANs are auto-created) |
 | `ip route P MASK GW` | `configure iproute add P/len GW` (`default` for 0.0.0.0/0); `ip routing` is consumed (realized per-VLAN) |
+| `monitor session N source interface ... [rx\|tx\|both]` + `destination interface X` (local SPAN) | one EXOS mirror instance per session: `create mirror <name>`, `configure mirror <name> to port <p>`, `add port <p> ingress\|egress\|ingress-and-egress`, `enable mirror <name>` |
+| `monitor session N source vlan ...` | `configure mirror <name> add vlan "<name>"` (EXOS VLAN mirroring is ingress-only; `tx`/`both` warned) |
 
 ### Behavioral details
 
@@ -105,6 +107,18 @@ running-config text
 - **LAG master** is the lowest-numbered member; member ports are excluded from
   individual VLAN assignment (their L2 config comes from the bundle).
 - **Stack detection**: more than one stack member ⇒ `slot:port` port naming.
+- **Mirroring (SPAN)**: each session maps to an EXOS mirror instance named
+  `monitor_<id>` by default (rename via the mapping's `mirrors` section; set it
+  to `DefaultMirror` to reuse the built-in instance, which skips
+  `create mirror`). A Cisco SPAN destination port does not switch normal
+  traffic, so the EXOS monitor port is removed from all VLANs and its own
+  L2/ACL config is skipped (warned). A Port-channel source expands to its
+  member ports; a Port-channel or LAG-member *destination* skips the session
+  (an EXOS monitor port cannot be in a load-share group). EXOS mirroring
+  always preserves VLAN tags — the behavior of Cisco
+  `encapsulation replicate` — so sessions without it are flagged. Multiple
+  sessions are translated but flagged: platforms limit concurrently enabled
+  mirrors (commonly 4 total, 2 with an egress filter).
 
 ## Warnings the generator emits
 
@@ -150,6 +164,13 @@ Embedded as `#` comments at the top of each `.xsf`:
   direction, vty/SNMP/route-map contexts) is reported, never silently dropped;
   ACLs with untranslated rules get an "incomplete" warning. See
   [docs/acl-patterns.md](docs/acl-patterns.md).
+- **SPAN edge cases** — supported subset is local SPAN (`source interface`
+  with `rx`/`tx`/`both`, `source vlan`, `destination interface`, optional
+  `encapsulation replicate`). RSPAN (`remote vlan`), ERSPAN (`type ...`),
+  `filter` restrictions, and other destination options are reported, never
+  silently dropped; a session left without a usable source or destination is
+  skipped with a warning. Filtered mirroring (only some traffic on a port,
+  like the mirror ACLs in policy files) is not generated.
 - STP/spanning-tree, port speed/duplex, PoE, QoS, storm-control, voice
   VLANs, LACP timer tuning.
 - **Multi-switch topology** — configs are translated independently; no VLAN
