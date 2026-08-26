@@ -118,7 +118,11 @@ running-config text
   always preserves VLAN tags — the behavior of Cisco
   `encapsulation replicate` — so sessions without it are flagged. Multiple
   sessions are translated but flagged: platforms limit concurrently enabled
-  mirrors (commonly 4 total, 2 with an egress filter).
+  mirrors (X440-G2: 4 total, only 1 may carry egress filters). The monitor
+  port is deleted from `Default` *before* `enable mirror`, which also keeps
+  the script non-interactive (EXOS otherwise raises a y/N prompt about
+  removing the monitor port's VLAN membership). Hardware-validated on an
+  X440-G2, see [docs/mirror-hw-test.md](docs/mirror-hw-test.md).
 
 ## Warnings the generator emits
 

@@ -450,6 +450,10 @@ def _plan_mirrors(
         )
 
         lines.append(f"# monitor session {sid}")
+        # removing the monitor port from Default first also avoids the
+        # interactive "remove VLAN membership from the monitor port? (y/N)"
+        # prompt that "enable mirror" raises inside "load script" otherwise
+        # (verified on X440-G2 / EXOS 33.4)
         for port in dest_ports:
             lines.append(f"configure vlan Default delete ports {port}")
         if name != "DefaultMirror":  # the DefaultMirror instance always exists
@@ -468,8 +472,9 @@ def _plan_mirrors(
     if len(mirror_ref) > 1:
         warnings.append(
             f"{len(mirror_ref)} mirror instances translated: EXOS platforms "
-            f"limit concurrently enabled mirrors (commonly 4 total, 2 with an "
-            f"egress filter); verify against the target platform"
+            f"limit concurrently enabled mirrors (measured on X440-G2: 4 "
+            f"total, only 1 may carry egress filters); verify against the "
+            f"target platform"
         )
     return lines, dest_names, mirror_ref
 
