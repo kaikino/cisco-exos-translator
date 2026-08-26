@@ -73,7 +73,30 @@ Traffic-level testing was not possible (no cables on the data ports); this
 validates syntax acceptance, HW mirror-instance allocation, and filter
 fidelity.
 
-## 5. Cleanup (nothing saved)
+## 5. Stacked pair (SummitStack `slot:port` form)
+
+Repeated 2026-08-26 on the 2-node X440G2 SummitStack ring (telnet
+10.170.11.87, slot 1 master; running the earlier SW-STACK-DEMO translated
+config). Sources 1:1–1:3 (untagged in USERS), monitor ports 1:11 / 2:12
+(Default-only, matching the translator's monitor-port state). Nothing saved;
+everything rolled back and re-verified against a pre-test
+`show ports ... vlan` snapshot.
+
+- **Cross-slot mirroring works both ways**: monitor on slot 2 with sources on
+  slot 1 (`configure mirror monitor_1 to port 2:12` + `add port 1:1 ingress`
+  / `1:2 egress` / `1:3 ingress-and-egress` / `add vlan "USERS"`), and the
+  reverse (monitor 1:11, source 2:1 ingress). Every generated line accepted
+  verbatim; `show mirror` matched filter-for-filter.
+- **No interactive prompts**, because the generated
+  `configure vlan Default delete ports <monitor-port>` ran first — same
+  behavior as standalone.
+- **Limits are per-stack, not per-slot**: the same `Maximum 4` enabled
+  mirrors and `Error: Maximum number of egress mirrors (1) already enabled!`
+  on a second egress filter, even with the two mirrors on different slots.
+- A mirror source VLAN can be an existing VLAN with members (USERS) with no
+  side effects on that VLAN's config.
+
+## 6. Cleanup (nothing saved)
 
 ```
 disable mirror monitor_1 / m2 / DefaultMirror
@@ -88,7 +111,10 @@ show mirror / show vlan               -> baseline restored
 ## Result
 
 Every construct the generator emits for mirroring was accepted verbatim on
-hardware, the switch's parsed view matched the Cisco SPAN source
-filter-for-filter, and the pre-delete of the monitor port from `Default`
-proved necessary to keep the script non-interactive. The mirroring path is
-hardware-validated at the configuration level.
+hardware — standalone (bare port numbers) and 2-node SummitStack
+(`slot:port`, including cross-slot monitor/source placement) — the switch's
+parsed view matched the Cisco SPAN source filter-for-filter, and the
+pre-delete of the monitor port from `Default` proved necessary to keep the
+script non-interactive. Mirror-count and egress limits are enforced
+per-switch/per-stack (4 enabled, 1 with egress filters on X440-G2). The
+mirroring path is hardware-validated at the configuration level.
