@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 # user-editable sections
-_SECTIONS = ("vlans", "ports", "lags", "mirrors")
+_SECTIONS = ("vlans", "ports", "lags", "mirrors", "mirror_egress_mode")
 
 
 # write a mapping dict as pretty JSON

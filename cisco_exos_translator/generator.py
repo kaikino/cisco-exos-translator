@@ -192,6 +192,13 @@ def build_default_mapping(config: ParsedConfig) -> dict:
         for sid in sorted(config.monitor_sessions)
     }
 
+    # only sessions with a SPAN filter ACL have an egress-mode choice to make
+    mirror_egress_mode = {
+        str(sid): "acl"
+        for sid, sess in sorted(config.monitor_sessions.items())
+        if sess.filter_acl
+    }
+
     return {
         "_help": [
             "Translation mapping: derived defaults from the Cisco config.",
@@ -207,6 +214,11 @@ def build_default_mapping(config: ParsedConfig) -> dict:
             "      'lacp' or 'static'.",
             "mirrors: Cisco monitor session id -> EXOS mirror instance name",
             "      (set to 'DefaultMirror' to reuse the built-in instance).",
+            "mirror_egress_mode: for sessions with a SPAN filter ACL, 'acl'",
+            "      (default) filters egress the same as ingress; set to",
+            "      'whole-port' on platforms whose egress ACLs don't support",
+            "      the mirror action (e.g. 4220-class) -- egress is then",
+            "      mirrored unfiltered while ingress stays filtered.",
             "Entries for interfaces no longer in the Cisco config are ignored;",
             "new interfaces get derived defaults until added here.",
         ],
@@ -215,6 +227,7 @@ def build_default_mapping(config: ParsedConfig) -> dict:
         "uplinks": {"start": None},
         "lags": lags,
         "mirrors": mirrors,
+        "mirror_egress_mode": mirror_egress_mode,
     }
 
 
@@ -358,8 +371,9 @@ _MIRROR_DIRECTION = {"rx": "ingress", "tx": "egress", "both": "ingress-and-egres
 
 # Plan the EXOS mirror instances for the config's SPAN sessions.
 # Returns (script lines, canonical names of destination ports,
-# {session id: (instance name, EXOS monitor ports, filter policy or None)}
-# for the reference block, and {policy name: .pol content} for FSPAN filters).
+# {session id: (instance name, EXOS monitor ports, filter policy or None,
+# "whole-port" or None)} for the reference block, and {policy name: .pol
+# content} for FSPAN filters).
 # A Cisco SPAN destination port does not switch normal traffic, so the EXOS
 # monitor port is removed from all VLANs and its own L2 config is skipped
 # (handled by the caller via the returned destination-port set).
@@ -370,12 +384,17 @@ def _plan_mirrors(
     vlan_names: dict[int, str],
     bundled: set[str],
     warnings: list[str],
-) -> tuple[list[str], set[str], dict[int, tuple[str, list[str], str | None]], dict[str, str]]:
+) -> tuple[
+    list[str], set[str],
+    dict[int, tuple[str, list[str], str | None, str | None]],
+    dict[str, str],
+]:
     lines: list[str] = []
     dest_names: set[str] = set()
-    mirror_ref: dict[int, tuple[str, list[str], str | None]] = {}
+    mirror_ref: dict[int, tuple[str, list[str], str | None, str | None]] = {}
     mirror_pols: dict[str, str] = {}
     mirror_names = mapping.get("mirrors") or {}
+    egress_modes = mapping.get("mirror_egress_mode") or {}
     used_names: set[str] = set()
 
     for sid, sess in sorted(config.monitor_sessions.items()):
@@ -441,6 +460,19 @@ def _plan_mirrors(
             if pol_base in mirror_pols:  # 32-char truncation collision
                 pol_base = _sanitize_vlan_name(f"flt_{sid}")
 
+        # egress_mode picks how a filtered session's egress traffic is
+        # mirrored: "acl" (default) filters it same as ingress; "whole-port"
+        # mirrors everything unfiltered, for platforms (e.g. 4220-class) that
+        # don't support an egress ACL mirror action at all
+        egress_mode = str(egress_modes.get(str(sid)) or "acl")
+        if egress_mode not in ("acl", "whole-port"):
+            warnings.append(
+                f"monitor session {sid}: mapping mirror_egress_mode "
+                f"'{egress_mode}' is not 'acl'/'whole-port'; using 'acl'"
+            )
+            egress_mode = "acl"
+        used_whole_port_egress = False
+
         # Sources: ports (with direction) and VLANs (EXOS mirrors VLANs
         # ingress-only). A Port-channel source expands to its member ports.
         src_lines: list[str] = []  # "add port/vlan" lines, before enable
@@ -471,9 +503,15 @@ def _plan_mirrors(
                 if filtered:
                     for d in {"rx": ["ingress"], "tx": ["egress"],
                               "both": ["ingress", "egress"]}[direction]:
-                        apply_lines.append(
-                            f"configure access-list {pol_base} ports {port} {d}"
-                        )
+                        if d == "egress" and egress_mode == "whole-port":
+                            used_whole_port_egress = True
+                            src_lines.append(
+                                f"configure mirror {name} add port {port} egress"
+                            )
+                        else:
+                            apply_lines.append(
+                                f"configure access-list {pol_base} ports {port} {d}"
+                            )
                 else:
                     src_lines.append(
                         f"configure mirror {name} add port {port} "
@@ -501,8 +539,15 @@ def _plan_mirrors(
                 f"monitor session {sid}: egress ACL mirror action is "
                 f"platform-dependent (verified working on X440-G2, filter "
                 f"policy bound before 'enable mirror'; 4220-class models do "
-                f"not support it at all -- use whole-port egress mirroring "
-                f"there instead)"
+                f"not support it at all -- set mirror_egress_mode to "
+                f"'whole-port' in the mapping file for those)"
+            )
+        if used_whole_port_egress:
+            warnings.append(
+                f"monitor session {sid}: mapping sets mirror_egress_mode "
+                f"'whole-port' -- egress traffic on the filtered source "
+                f"port(s) is mirrored unfiltered; ingress stays filtered by "
+                f"{pol_base}.pol"
             )
         if not (src_lines or apply_lines):
             warnings.append(
@@ -551,7 +596,11 @@ def _plan_mirrors(
         if filtered:
             mirror_pols[pol_base] = _mirror_policy(sess.filter_acl, filter_rules, name)
         dest_names.update(sess.destination_ports)
-        mirror_ref[sid] = (name, dest_ports, pol_base if filtered else None)
+        mirror_ref[sid] = (
+            name, dest_ports,
+            pol_base if filtered else None,
+            "whole-port" if used_whole_port_egress else None,
+        )
 
     if len(mirror_ref) > 1:
         warnings.append(
@@ -608,7 +657,7 @@ def _unsupported_summary(config: ParsedConfig, max_unique: int = 40) -> list[str
 def _translation_reference(
     config: ParsedConfig, vlan_names: dict[int, str], port_map: dict[str, str],
     lag_map: dict[int, tuple[str, list[str], bool]],
-    mirror_ref: dict[int, tuple[str, list[str], str | None]],
+    mirror_ref: dict[int, tuple[str, list[str], str | None, str | None]],
 ) -> list[str]:
     lines = ["# Translation reference (from the mapping file; edit it and re-run to change)"]
 
@@ -652,8 +701,9 @@ def _translation_reference(
     # Mirroring: Cisco SPAN session -> EXOS mirror instance and monitor port
     if mirror_ref:
         lines.append("# Mirroring (Cisco monitor session -> EXOS mirror instance):")
-        for sid, (name, dest_ports, pol) in sorted(mirror_ref.items()):
-            flt = f"; filtered by {pol}.pol" if pol else ""
+        for sid, (name, dest_ports, pol, egress_mode) in sorted(mirror_ref.items()):
+            egress_note = " (egress: whole-port)" if egress_mode == "whole-port" else ""
+            flt = f"; filtered by {pol}.pol{egress_note}" if pol else ""
             lines.append(
                 f"#   monitor session {sid} -> {name}  "
                 f"(monitor port: {', '.join(dest_ports)}{flt})"
