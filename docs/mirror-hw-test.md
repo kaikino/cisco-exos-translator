@@ -172,6 +172,43 @@ this test, not the two-session `sample.cfg`)
   per-port VLAN listing, not just `show vlan`'s port *count*, before
   declaring baseline restored.
 
+## 8. Egress fallback for platforms without egress ACL mirror action
+
+Executed 2026-08-27 on the standalone X440G2, validating the
+`mirror_egress_mode: "whole-port"` mapping override — the exact hybrid
+pattern used on the two 4220-class edge switches in the source slide deck:
+ingress mirrored through the filter ACL, egress mirrored whole-port
+(unfiltered), on the *same* mirror instance.
+
+```
+check policy monitor_1_filter        -> "Policy file check successful."
+configure vlan Default delete ports 12
+create mirror monitor_1
+configure mirror monitor_1 to port 12
+configure mirror monitor_1 add port 1 egress
+configure mirror monitor_1 add port 2 egress
+configure access-list monitor_1_filter ports 1 ingress
+configure access-list monitor_1_filter ports 2 ingress
+enable mirror monitor_1
+```
+
+```
+show mirror
+    monitor_1 (Enabled)
+        Mirror to port: 12
+        Port 1, all vlans, egress only
+        Port 2, all vlans, egress only
+show access-list
+        1  monitor_1_filter  ingress  3  0
+        2  monitor_1_filter  ingress  3  0
+```
+
+Every line accepted, no errors, no prompts — the whole-port egress add and
+the ACL ingress bind coexist cleanly on one instance, and `show mirror`
+confirms egress is unfiltered (whole port) while `show access-list` confirms
+ingress is still ACL-bound. Rolled back and re-verified against the
+16/16-ports-in-Default baseline afterward.
+
 ## Result
 
 Every construct the generator emits for mirroring was accepted verbatim on
@@ -183,5 +220,7 @@ script non-interactive. Mirror-count and egress limits are enforced
 per-switch/per-stack (4 enabled, 1 with egress filters on X440-G2). Filtered
 mirroring (FSPAN) is likewise hardware-validated, including the
 enabled-instance-vs-egress-ACL-bind ordering constraint the generator now
-encodes. The mirroring path — whole-port and filtered — is hardware-validated
-at the configuration level.
+encodes, and the `whole-port` egress fallback for platforms whose egress
+ACLs can't carry a mirror action. The mirroring path — whole-port, filtered,
+and hybrid filtered-ingress/whole-port-egress — is hardware-validated at the
+configuration level.

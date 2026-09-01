@@ -140,8 +140,12 @@ running-config text
   sources ignore the filter (mirrored unfiltered, warned) since EXOS has no
   per-VLAN-source ACL hook. Egress ACL mirror actions are further
   platform-dependent — 4220-class hardware doesn't support the action at all
-  (per the source material for this feature); use whole-port egress
-  mirroring there instead.
+  — so the mapping's `mirror_egress_mode` (per session id, default `acl`) can
+  be set to `whole-port`: egress on the filtered source ports is then
+  mirrored unfiltered (`configure mirror <name> add port <p> egress`) while
+  ingress stays ACL-filtered, matching the deployed pattern this feature was
+  modeled on. Hardware-validated on X440-G2 (both `acl` and `whole-port`
+  modes), see [docs/mirror-hw-test.md](docs/mirror-hw-test.md).
 
 ## Warnings the generator emits
 
