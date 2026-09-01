@@ -92,6 +92,11 @@ def validate_parsed_config(config: ParsedConfig) -> list[str]:
                     f"monitor session {sid}: source VLAN {vid} "
                     f"is referenced but not defined"
                 )
+        if sess.filter_acl is not None and sess.filter_acl not in config.acls:
+            warnings.append(
+                f"monitor session {sid}: filter ACL {sess.filter_acl} is "
+                f"referenced but not defined; sources mirrored unfiltered"
+            )
 
     # ACLs with untranslated ACEs are semantically incomplete (a skipped deny
     # over-permits); count them per ACL and warn once

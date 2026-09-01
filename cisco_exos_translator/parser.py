@@ -116,6 +116,10 @@ RE_MONITOR_DEST = re.compile(
     r"^destination\s+interface\s+(.+?)(\s+encapsulation\s+replicate)?$",
     re.IGNORECASE,
 )
+#   the rest of a filter line: "filter ip access-group <name|number>" (FSPAN)
+RE_MONITOR_FILTER = re.compile(
+    r"^filter\s+ip\s+access-group\s+(\S+)$", re.IGNORECASE
+)
 
 
 # _get_or_create_* helpers return the IR object for a key if it exists or creates it otherwise
@@ -457,13 +461,21 @@ def _apply_monitor_line(
             sess.encapsulation_replicate = True
         return
 
+    m = RE_MONITOR_FILTER.match(rest)
+    if m:
+        sess = _get_or_create_monitor_session(config, session_id, line.line_number)
+        if sess.filter_acl is not None and sess.filter_acl != m.group(1):
+            raise ValueError("multiple SPAN filter ACLs on one session")
+        sess.filter_acl = m.group(1)
+        return
+
     low = rest.lower()
     if "remote" in low.split():
         raise ValueError("RSPAN (remote vlan) is not supported")
     if low.startswith("type"):
         raise ValueError("only local SPAN is supported (no ERSPAN/capture types)")
     if low.startswith("filter"):
-        raise ValueError("SPAN filter is not supported")
+        raise ValueError("only 'filter ip access-group' is supported")
     raise ValueError("unsupported monitor session command")
 
 

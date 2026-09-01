@@ -271,6 +271,39 @@ def _membership_lines(
     return lines
 
 
+# Match conditions of one parsed ACE as policy-file condition strings
+def _ace_conditions(r) -> list[str]:
+    conds = []
+    if r.protocol:
+        conds.append(f"protocol {r.protocol}")
+    if r.source:
+        conds.append(f"source-address {r.source}")
+    if r.source_port:
+        lo, hi = r.source_port
+        conds.append(f"source-port {lo}" if lo == hi else f"source-port {lo} - {hi}")
+    if r.destination:
+        conds.append(f"destination-address {r.destination}")
+    if r.destination_port:
+        lo, hi = r.destination_port
+        conds.append(
+            f"destination-port {lo}" if lo == hi else f"destination-port {lo} - {hi}"
+        )
+    return conds
+
+
+# Render one policy entry: conditions plus one or more action statements
+def _policy_entry(lines: list[str], label: str, conds: list[str], actions: list[str]) -> None:
+    lines.append(f"entry {label} {{")
+    lines.append("    if {")
+    for c in conds:
+        lines.append(f"        {c};")
+    lines.append("    } then {")
+    for a in actions:
+        lines.append(f"        {a};")
+    lines.append("    }")
+    lines.append("}")
+
+
 # Render one Cisco ACL as an EXOS policy file (.pol): ordered entries, remarks
 # preserved as # comments, plus a trailing deny-all (Cisco's implicit deny;
 # EXOS permits unmatched traffic by default)
@@ -282,29 +315,7 @@ def _acl_policy(acl_name: str, rules) -> str:
             lines.append(f"# {r.remark}")
             continue
         n += 10
-        conds = []
-        if r.protocol:
-            conds.append(f"protocol {r.protocol}")
-        if r.source:
-            conds.append(f"source-address {r.source}")
-        if r.source_port:
-            lo, hi = r.source_port
-            conds.append(f"source-port {lo}" if lo == hi else f"source-port {lo} - {hi}")
-        if r.destination:
-            conds.append(f"destination-address {r.destination}")
-        if r.destination_port:
-            lo, hi = r.destination_port
-            conds.append(
-                f"destination-port {lo}" if lo == hi else f"destination-port {lo} - {hi}"
-            )
-        lines.append(f"entry r{n} {{")
-        lines.append("    if {")
-        for c in conds:
-            lines.append(f"        {c};")
-        lines.append("    } then {")
-        lines.append(f"        {r.action};")
-        lines.append("    }")
-        lines.append("}")
+        _policy_entry(lines, f"r{n}", _ace_conditions(r), [r.action])
     # match all IPv4 (not an empty match): Cisco's implicit deny applies to IP
     # traffic only -- an unconditional deny here would also drop ARP etc.
     lines.append("# Cisco implicit deny (IPv4 only)")
@@ -318,13 +329,37 @@ def _acl_policy(acl_name: str, rules) -> str:
     return "\n".join(lines) + "\n"
 
 
+# Render a Cisco FSPAN filter ACL as an EXOS mirror policy file (.pol).
+# On Cisco the filter only selects what gets mirrored: permit = mirror the
+# packet, deny = don't; the ACL never blocks traffic. So every entry forwards
+# ("permit") and only Cisco-permit entries add the mirror action; unmatched
+# traffic needs no entry (EXOS forwards without mirroring by default).
+def _mirror_policy(acl_name: str, rules, mirror_name: str) -> str:
+    lines = [
+        f"# translated from Cisco SPAN filter ACL {acl_name}",
+        f"# selects traffic for mirror instance {mirror_name}; never blocks",
+    ]
+    n = 0
+    for r in rules:
+        if r.action == "remark":
+            lines.append(f"# {r.remark}")
+            continue
+        n += 10
+        actions = ["permit"]
+        if r.action == "permit":
+            actions.append(f"mirror {mirror_name}")
+        _policy_entry(lines, f"r{n}", _ace_conditions(r), actions)
+    return "\n".join(lines) + "\n"
+
+
 # Cisco SPAN direction -> EXOS mirror source filter keyword
 _MIRROR_DIRECTION = {"rx": "ingress", "tx": "egress", "both": "ingress-and-egress"}
 
 
 # Plan the EXOS mirror instances for the config's SPAN sessions.
-# Returns (script lines, canonical names of destination ports, and
-# {session id: (instance name, EXOS monitor ports)} for the reference block).
+# Returns (script lines, canonical names of destination ports,
+# {session id: (instance name, EXOS monitor ports, filter policy or None)}
+# for the reference block, and {policy name: .pol content} for FSPAN filters).
 # A Cisco SPAN destination port does not switch normal traffic, so the EXOS
 # monitor port is removed from all VLANs and its own L2 config is skipped
 # (handled by the caller via the returned destination-port set).
@@ -335,10 +370,11 @@ def _plan_mirrors(
     vlan_names: dict[int, str],
     bundled: set[str],
     warnings: list[str],
-) -> tuple[list[str], set[str], dict[int, tuple[str, list[str]]]]:
+) -> tuple[list[str], set[str], dict[int, tuple[str, list[str], str | None]], dict[str, str]]:
     lines: list[str] = []
     dest_names: set[str] = set()
-    mirror_ref: dict[int, tuple[str, list[str]]] = {}
+    mirror_ref: dict[int, tuple[str, list[str], str | None]] = {}
+    mirror_pols: dict[str, str] = {}
     mirror_names = mapping.get("mirrors") or {}
     used_names: set[str] = set()
 
@@ -387,9 +423,28 @@ def _plan_mirrors(
             name = _sanitize_vlan_name(f"{name}_{sid}")
         used_names.add(name)
 
+        # FSPAN filter: only ACL-permitted packets are mirrored, realized as a
+        # mirror-action policy file applied to the source ports (the mirror
+        # instance then gets no port sources of its own)
+        filter_rules = config.acls.get(sess.filter_acl) if sess.filter_acl else None
+        filtered = bool(filter_rules) and any(
+            r.action in ("permit", "deny") for r in filter_rules
+        )
+        if sess.filter_acl and sess.filter_acl in config.acls and not filtered:
+            warnings.append(
+                f"monitor session {sid}: filter ACL {sess.filter_acl} has no "
+                f"translatable rules; sources mirrored unfiltered"
+            )
+        pol_base = ""
+        if filtered:
+            pol_base = _sanitize_vlan_name(f"{name}_filter")
+            if pol_base in mirror_pols:  # 32-char truncation collision
+                pol_base = _sanitize_vlan_name(f"flt_{sid}")
+
         # Sources: ports (with direction) and VLANs (EXOS mirrors VLANs
         # ingress-only). A Port-channel source expands to its member ports.
-        src_lines: list[str] = []
+        src_lines: list[str] = []  # "add port/vlan" lines, before enable
+        apply_lines: list[str] = []  # filter policy applications, after enable
         seen: set[tuple[str, str]] = set()
         for cname, direction in sess.source_ports:
             iface = config.interfaces.get(cname)
@@ -413,10 +468,17 @@ def _plan_mirrors(
                 if (port, direction) in seen:
                     continue
                 seen.add((port, direction))
-                src_lines.append(
-                    f"configure mirror {name} add port {port} "
-                    f"{_MIRROR_DIRECTION[direction]}"
-                )
+                if filtered:
+                    for d in {"rx": ["ingress"], "tx": ["egress"],
+                              "both": ["ingress", "egress"]}[direction]:
+                        apply_lines.append(
+                            f"configure access-list {pol_base} ports {port} {d}"
+                        )
+                else:
+                    src_lines.append(
+                        f"configure mirror {name} add port {port} "
+                        f"{_MIRROR_DIRECTION[direction]}"
+                    )
         for vid, direction in sess.source_vlans:
             if direction != "rx":
                 warnings.append(
@@ -429,7 +491,20 @@ def _plan_mirrors(
             seen.add((f"vlan{vid}", ""))
             vlan = "Default" if vid == 1 else f'"{vlan_names[vid]}"'
             src_lines.append(f"configure mirror {name} add vlan {vlan}")
-        if not src_lines:
+        if filtered and sess.source_vlans:
+            warnings.append(
+                f"monitor session {sid}: the SPAN filter does not apply to "
+                f"VLAN sources; they are mirrored unfiltered"
+            )
+        if filtered and any(l.endswith(" egress") for l in apply_lines):
+            warnings.append(
+                f"monitor session {sid}: egress ACL mirror action is "
+                f"platform-dependent (verified working on X440-G2, filter "
+                f"policy bound before 'enable mirror'; 4220-class models do "
+                f"not support it at all -- use whole-port egress mirroring "
+                f"there instead)"
+            )
+        if not (src_lines or apply_lines):
             warnings.append(
                 f"monitor session {sid}: no source could be translated; "
                 f"session skipped"
@@ -465,9 +540,18 @@ def _plan_mirrors(
                 f"configure mirror {name} to port-list {','.join(dest_ports)}"
             )
         lines.extend(src_lines)
+        # the filter policy binds BEFORE "enable mirror": on X440-G2, binding
+        # a "mirror <name>;" policy action to an already-enabled instance
+        # fails with "Feature unavailable" on egress (ingress is unaffected,
+        # but the same order works for both, so it is used unconditionally).
+        # The .pol file must also be on the switch before this script is
+        # loaded, same as regular ACLs.
+        lines.extend(apply_lines)
         lines.append(f"enable mirror {name}")
+        if filtered:
+            mirror_pols[pol_base] = _mirror_policy(sess.filter_acl, filter_rules, name)
         dest_names.update(sess.destination_ports)
-        mirror_ref[sid] = (name, dest_ports)
+        mirror_ref[sid] = (name, dest_ports, pol_base if filtered else None)
 
     if len(mirror_ref) > 1:
         warnings.append(
@@ -476,7 +560,7 @@ def _plan_mirrors(
             f"total, only 1 may carry egress filters); verify against the "
             f"target platform"
         )
-    return lines, dest_names, mirror_ref
+    return lines, dest_names, mirror_ref, mirror_pols
 
 
 # Summarize every Cisco line the parser could not translate (global and
@@ -524,7 +608,7 @@ def _unsupported_summary(config: ParsedConfig, max_unique: int = 40) -> list[str
 def _translation_reference(
     config: ParsedConfig, vlan_names: dict[int, str], port_map: dict[str, str],
     lag_map: dict[int, tuple[str, list[str], bool]],
-    mirror_ref: dict[int, tuple[str, list[str]]],
+    mirror_ref: dict[int, tuple[str, list[str], str | None]],
 ) -> list[str]:
     lines = ["# Translation reference (from the mapping file; edit it and re-run to change)"]
 
@@ -568,10 +652,11 @@ def _translation_reference(
     # Mirroring: Cisco SPAN session -> EXOS mirror instance and monitor port
     if mirror_ref:
         lines.append("# Mirroring (Cisco monitor session -> EXOS mirror instance):")
-        for sid, (name, dest_ports) in sorted(mirror_ref.items()):
+        for sid, (name, dest_ports, pol) in sorted(mirror_ref.items()):
+            flt = f"; filtered by {pol}.pol" if pol else ""
             lines.append(
                 f"#   monitor session {sid} -> {name}  "
-                f"(monitor port: {', '.join(dest_ports)})"
+                f"(monitor port: {', '.join(dest_ports)}{flt})"
             )
 
     lines.append("")
@@ -671,7 +756,7 @@ def generate_exos_config(
 
     # Mirroring plan (emitted at the end): needed up front because SPAN
     # destination ports are excluded from normal port configuration
-    mirror_lines, mirror_dest, mirror_ref = _plan_mirrors(
+    mirror_lines, mirror_dest, mirror_ref, mirror_pols = _plan_mirrors(
         config, mapping, port_map, vlan_names, bundled, warnings
     )
 
@@ -865,11 +950,14 @@ def generate_exos_config(
             if po_id in lag_map:
                 applied.setdefault(acl, []).append(f"ports {lag_map[po_id][0]}")
 
-    for acl in sorted(set(config.acls) - set(applied)):
+    filter_acls = {
+        s.filter_acl for s in config.monitor_sessions.values() if s.filter_acl
+    }
+    for acl in sorted(set(config.acls) - set(applied) - filter_acls):
         warnings.append(
             f"ACL {acl}: defined but not applied to any translated target; skipped"
         )
-    pol_files: dict[str, str] = {}  # policy name -> .pol file content
+    pol_files: dict[str, str] = dict(mirror_pols)  # policy name -> .pol content
     if applied:
         out.append("")
         out.append("# ACLs (policy files; upload each <name>.pol to the switch")
@@ -892,6 +980,11 @@ def generate_exos_config(
     if mirror_lines:
         out.append("")
         out.append("# Mirroring (SPAN)")
+        if mirror_pols:
+            out.append(
+                "# (filter policy files: upload each <name>.pol to the switch"
+            )
+            out.append("# BEFORE loading this script)")
         out.extend(mirror_lines)
 
     # Prepend the translation reference, then the warning banner, so both travel

@@ -92,6 +92,9 @@ class MonitorSession:
     # (vlan id, direction)
     source_vlans: list[tuple[int, str]] = field(default_factory=list)
     destination_ports: list[str] = field(default_factory=list)  # canonical names
+    # "filter ip access-group <acl>" (FSPAN): only ACL-permitted packets are
+    # mirrored; the filter never blocks traffic
+    filter_acl: Optional[str] = None
     # "encapsulation replicate" on the destination (tags preserved on copies)
     encapsulation_replicate: bool = False
     source_lines: list[int] = field(default_factory=list)
