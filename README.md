@@ -91,6 +91,7 @@ running-config text
 | `ip route P MASK GW` | `configure iproute add P/len GW` (`default` for 0.0.0.0/0); `ip routing` is consumed (realized per-VLAN) |
 | `monitor session N source interface ... [rx\|tx\|both]` + `destination interface X` (local SPAN) | one EXOS mirror instance per session: `create mirror <name>`, `configure mirror <name> to port <p>`, `add port <p> ingress\|egress\|ingress-and-egress`, `enable mirror <name>` |
 | `monitor session N source vlan ...` | `configure mirror <name> add vlan "<name>"` (EXOS VLAN mirroring is ingress-only; `tx`/`both` warned) |
+| `monitor session N filter ip access-group <ACL>` (FSPAN) | a mirror-action policy file (`<name>-acls/<mirror>_filter.pol`) applied to the source ports instead of `add port`; every Cisco `permit` ACE gets a `mirror <name>;` action, `deny` ACEs pass through unmirrored — the filter only selects what's copied, it never blocks live traffic |
 
 ### Behavioral details
 
@@ -122,7 +123,25 @@ running-config text
   port is deleted from `Default` *before* `enable mirror`, which also keeps
   the script non-interactive (EXOS otherwise raises a y/N prompt about
   removing the monitor port's VLAN membership). Hardware-validated on an
-  X440-G2, see [docs/mirror-hw-test.md](docs/mirror-hw-test.md).
+  X440-G2 and a 2-node SummitStack, see
+  [docs/mirror-hw-test.md](docs/mirror-hw-test.md).
+- **Filtered mirroring (FSPAN)**: `monitor session N filter ip access-group
+  <ACL>` mirrors only the ACL-permitted traffic instead of the whole source
+  port — the pattern used to mirror just ICMP to/from a monitoring host
+  without flooding the capture port. Realized as a policy file whose entries
+  all `permit` (so traffic keeps flowing) but only the Cisco-`permit` entries
+  add `mirror <name>;`; applied to the source ports with `configure
+  access-list <name> ports <p> ingress|egress` *instead of* `add port` on the
+  mirror instance itself. The filter ACL's own bind must complete **before**
+  `enable mirror` — on X440-G2, binding an ACL with a `mirror <name>;` action
+  against an *already-enabled* instance fails egress-direction binds with
+  `Feature unavailable` (ingress is unaffected); binding first sidesteps it
+  and is used unconditionally since it works for both directions. VLAN
+  sources ignore the filter (mirrored unfiltered, warned) since EXOS has no
+  per-VLAN-source ACL hook. Egress ACL mirror actions are further
+  platform-dependent — 4220-class hardware doesn't support the action at all
+  (per the source material for this feature); use whole-port egress
+  mirroring there instead.
 
 ## Warnings the generator emits
 
@@ -170,11 +189,10 @@ Embedded as `#` comments at the top of each `.xsf`:
   [docs/acl-patterns.md](docs/acl-patterns.md).
 - **SPAN edge cases** — supported subset is local SPAN (`source interface`
   with `rx`/`tx`/`both`, `source vlan`, `destination interface`, optional
-  `encapsulation replicate`). RSPAN (`remote vlan`), ERSPAN (`type ...`),
-  `filter` restrictions, and other destination options are reported, never
-  silently dropped; a session left without a usable source or destination is
-  skipped with a warning. Filtered mirroring (only some traffic on a port,
-  like the mirror ACLs in policy files) is not generated.
+  `encapsulation replicate`, `filter ip access-group` for FSPAN). RSPAN
+  (`remote vlan`), ERSPAN (`type ...`), and non-ACL filter forms are
+  reported, never silently dropped; a session left without a usable source
+  or destination is skipped with a warning.
 - STP/spanning-tree, port speed/duplex, PoE, QoS, storm-control, voice
   VLANs, LACP timer tuning.
 - **Multi-switch topology** — configs are translated independently; no VLAN

@@ -108,6 +108,70 @@ delete vlan VLAN_20
 show mirror / show vlan               -> baseline restored
 ```
 
+## 7. Filtered mirroring (FSPAN) — mirror-only-ICMP-to-DNS-server
+
+Executed 2026-08-27 on the standalone X440G2, validating the pattern from
+the source slide deck: `monitor session N filter ip access-group <ACL>` +
+a two-line ACL (`permit icmp host <DNS-IP> any` / `permit icmp any host
+<DNS-IP>`), translated to `sample.cfg`'s `MIRROR_PING` / monitor session 2.
+The real generated `.pol` file was uploaded byte-for-byte via the switch's
+own `edit policy` (vi), not just a dynamic-ACL approximation.
+
+```
+# monitor_2_filter.pol, as generated and uploaded verbatim
+entry r10 { if { protocol icmp; source-address 100.86.255.2/32; }
+            then { permit; mirror monitor_2; } }
+entry r20 { if { protocol icmp; destination-address 100.86.255.2/32; }
+            then { permit; mirror monitor_2; } }
+```
+
+```
+check policy monitor_2_filter        -> "Policy file check successful."
+```
+
+Applied the exact sequence the generator emits:
+
+```
+configure vlan Default delete ports 12
+create mirror monitor_1
+configure mirror monitor_1 to port 12
+configure access-list monitor_1_filter ports 1 ingress
+configure access-list monitor_1_filter ports 1 egress
+configure access-list monitor_1_filter ports 2 ingress
+configure access-list monitor_1_filter ports 2 egress
+enable mirror monitor_1
+```
+
+(names above are from the isolated single-session `fspan-test.cfg` used for
+this test, not the two-session `sample.cfg`)
+
+- **All four binds (ingress + egress, two source ports) succeeded**, and
+  `enable mirror` raised no prompt.
+- **Ordering matters and is hardware-enforced, not cosmetic**: binding an ACL
+  whose action is `mirror <name>;` against a mirror instance that is
+  **already `(Enabled)`** fails on egress direction specifically:
+  `Error: ACL install operation failed - vlan *, port N, rule "rNN", Feature
+  unavailable`. Ingress binds against an enabled instance work fine — only
+  egress cares. Isolated with a battery of controlled probes (see below);
+  the fix is binding the filter policy **before** `enable mirror`, which the
+  generator now does unconditionally (see [generator.py](../cisco_exos_translator/generator.py)).
+- **It is not about naming**: `mirror;` (default), `mirror DefaultMirror;`,
+  and `mirror <freshly-created-but-disabled>;` all bind fine on egress.
+  Only a reference to a **currently-enabled** instance fails on egress.
+- Re-running with the corrected order (filter bind, *then* `enable mirror`)
+  succeeded on all four binds with zero errors and zero prompts — confirmed
+  end-to-end with the real uploaded `.pol` file, not just dynamic ACLs.
+- A `deny` ACE (the trailing `10.9.0.0/16` rule in the fuller `fspan-test.cfg`
+  ACL) correctly renders as `permit;` with **no** mirror action — the filter
+  never blocks traffic, matching Cisco FSPAN semantics.
+- **Cleanup gap caught and fixed**: an earlier probe (`enable mirror m6` on
+  port 11) silently left port 11 out of `Default` when its mirror was later
+  deleted without restoring VLAN membership — `show ports ... vlan` after
+  cleanup caught the `0/15` vs `0/16` discrepancy before ending the session.
+  Lesson for future hardware sessions on this project: verify with a
+  per-port VLAN listing, not just `show vlan`'s port *count*, before
+  declaring baseline restored.
+
 ## Result
 
 Every construct the generator emits for mirroring was accepted verbatim on
@@ -116,5 +180,8 @@ hardware — standalone (bare port numbers) and 2-node SummitStack
 parsed view matched the Cisco SPAN source filter-for-filter, and the
 pre-delete of the monitor port from `Default` proved necessary to keep the
 script non-interactive. Mirror-count and egress limits are enforced
-per-switch/per-stack (4 enabled, 1 with egress filters on X440-G2). The
-mirroring path is hardware-validated at the configuration level.
+per-switch/per-stack (4 enabled, 1 with egress filters on X440-G2). Filtered
+mirroring (FSPAN) is likewise hardware-validated, including the
+enabled-instance-vs-egress-ACL-bind ordering constraint the generator now
+encodes. The mirroring path — whole-port and filtered — is hardware-validated
+at the configuration level.
