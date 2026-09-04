@@ -1,4 +1,4 @@
-# ハードウェアテスト文書 (実機検証)
+# 1. ハードウェアテスト文書 (実機検証)
 
 本ツールが生成した EXOS 設定 (`.xsf` の行と `.pol` ファイル) を Extreme 実機に投入し、
 構文の受理、ハードウェアへの反映、機種固有の制約を確認した記録です。
@@ -7,7 +7,7 @@
 データポートにケーブルを接続できない環境だったため、トラフィックを流しての確認は行っていません。
 本書の検証はすべて **設定レベル** (コマンドの受理、TCAM へのコンパイル、`show` 出力の一致) です。
 
-## 1. 検証環境
+## 2. 検証環境
 
 | 項目 | 内容 |
 |---|---|
@@ -17,18 +17,9 @@
 | 対象ポート | 各機器とも、他の通信に使用されていない未使用のデータポートのみ |
 | ファイル転送 | TFTP サーバがなかったため、スイッチ上の `edit policy` (vi) を expect スクリプトで駆動して `.pol` の内容をそのまま書き込んだ。ファイルは `/usr/local/cfg` に置かれ、`tftp get` と機能的に同じ結果 |
 
-## 2. 検証方針・安全対策
-
-貸出元が管理する共有の検証機器を使用したため、既存の通信・設定に影響を与えないよう次の方針で実施しました。
-
-- 未使用のデータポートのみ使用し、既存の通信が流れているポートや VLAN には手を加えない。
-- 設定変更は検証終了時に必ずすべて元に戻し (ロールバック)、`show ports <範囲> vlan` で
-  **ポート 1 つずつ** の VLAN 所属を検証前のスナップショットと突合してから終了する。
-- `save configuration` は一切実行しない (再起動すれば検証前の状態に戻る)。
-
 ## 3. 検証結果一覧
 
-| No  | 検証項目 | 機器 | 結果 |
+| No | 検証項目 | 機器 | 結果 |
 |---|---|---|---|
 | 1 | ACL: 生成した `.pol` (名前付き extended、番号付き extended) の `check policy` とポートへの適用 | ① | ○ |
 | 2 | 通常ミラーリング: 複数ポート、rx / tx / both、VLAN ソースを含む構成 | ① | ○ |
@@ -38,7 +29,7 @@
 
 ## 4. 検証項目 1: ACL (.pol ポリシーファイル)
 
-機器 ①。スイッチは `pre-dem.cfg` 稼働状態。
+機器 ①。
 
 ### 4.1 生成 (作業用 PC)
 
@@ -160,7 +151,7 @@ Cisco 側の rx / tx / both / source vlan とフィルタ単位で一致しま�
   continue? (y/N)` が表示されました。`monitor_1` でプロンプトが出なかったのは、生成された
   `configure vlan Default delete ports 12` が先に実行されていたためです。対話プロンプトは
   `load script` を止めるため、ツールがこの行を必ず出力する根拠になっています。
-- **同時有効化**: 3 つのミラー (`monitor_1`、別名のインスタンス、`DefaultMirror`) を同時に有効化でき ました。
+- **同時有効化**: 3 つのミラー (`monitor_1`、別名のインスタンス、`DefaultMirror`) を同時に有効化できました。
 - **egress の上限**: 有効化済みの 2 つ目のミラーに egress フィルタを追加すると
   `Error: Maximum number of egress mirrors (1) already enabled!` で拒否されました。
   X440-G2 では egress / both フィルタを持てる有効ミラーは **1 つだけ** です
@@ -183,7 +174,7 @@ show mirror / show vlan               -> 初期状態に復帰
 
 ## 6. 検証項目 3: 通常ミラーリング (SummitStack、`slot:port` 表記)
 
-機器 ② (スロット 1 が Master、以前の SW-STACK-DEMO 変換結果を稼働中)。
+機器 ② (スロット 1 が Master。同梱の `stack-demo.cfg` を変換した設定を稼働中)。
 ソースは `1:1` 〜 `1:3` (USERS に untagged 所属)、モニターポートは `1:11` / `2:12`
 (`Default` のみ所属。ツールが想定するモニターポートの状態と同じ)。
 検証前に取得した `show ports ... vlan` のスナップショットと突合してロールバックしました。
@@ -200,10 +191,12 @@ show mirror / show vlan               -> 初期状態に復帰
 
 ## 7. 検証項目 4: FSPAN (フィルタ付きミラーリング)
 
-機器 ①。元スライドの「DNS サーバとの ICMP だけをミラーする」パターン
-(`monitor session N filter ip access-group <ACL>` + 2 行の ACL) を、`sample.cfg` の `MIRROR_PING` /
-monitor session 2 に相当する単一セッションの設定 (`fspan-test.cfg`) で検証しました。
-以下のミラー名・ポリシー名はその設定のものです。
+機器 ①。「特定ホストとの ICMP だけをミラーする」という想定のテスト用パターン
+(`monitor session N filter ip access-group <ACL>` + 2 行の ACL) を検証しました。
+入力には 2 種類の Cisco 設定を使っています。ポリシーファイルの構文検証 (7.1) は同梱の `sample.cfg`
+(monitor session 2 → `monitor_2` / `monitor_2_filter.pol`) の生成物で行い、スイッチへの投入 (7.2 以降) は
+同じ ACL を単一セッションにした検証用設定 `fspan-test.cfg` (monitor session 1 → `monitor_1` /
+`monitor_1_filter.pol`、こちらも `check policy` 済み) の生成物で行いました。名前の違いはこの入力の違いによるものです。
 
 ### 7.1 ポリシーファイル
 
@@ -236,7 +229,7 @@ enable mirror monitor_1
 ```
 
 - **4 バインド (ingress + egress × 2 ポート) すべて成功**し、`enable mirror` の確認プロンプトも発生しませんでした。
-- Cisco の `deny` に相当するエントリ (より大きな `fspan-test.cfg` の ACL 末尾にある `10.9.0.0/16` のルール) は
+- Cisco の `deny` に相当するエントリ (`fspan-test.cfg` の ACL 末尾に置いた `10.9.0.0/16` の deny) は
   `permit;` のみ (mirror アクションなし) で出力され、通信を止めないことを確認しました。Cisco FSPAN の意味と一致します。
 
 ### 7.3 バインド順序の制約 (重要、ハードウェアが強制)
@@ -263,21 +256,17 @@ Error: ACL install operation failed - vlan *, port 1, rule "r10", Feature unavai
 (両方向でこの順序が安全なため、方向を区別せず常に適用。[generator.py](../cisco_exos_translator/generator.py))。
 修正後の順序で再投入したところ、4 バインドすべてエラーなし・プロンプトなしで成功しました。
 
-### 7.4 クリーンアップで見つかった問題と教訓
+### 7.4 クリーンアップ時の見落とし
 
-先行の切り分け (`enable mirror m6`、ポート 11) の後、そのミラーを削除した際にポート 11 の VLAN 所属を戻し忘れ、
-ポート 11 が `Default` から外れたままになっていました。`show vlan` のポート **数** では気づかず、
-`show ports ... vlan` のポート単位の一覧で `0/15` と `0/16` の差として検出し、セッション終了前に復旧しました。
-
-今後の実機セッションでは、`show vlan` のポート数ではなく **ポート単位の VLAN 一覧** で初期状態への復帰を確認します
-(2 章の方針はこの教訓を反映したものです)。
+切り分け用に作成したミラー (`m6`、モニターポート 11) を削除した際、ポート 11 を `Default` に戻し忘れていました。
+`show vlan` のポート数では分からず、`show ports ... vlan` のポート単位の一覧で `0/15` と `0/16` の差として
+検出し、セッション終了前に復旧しています。以後の復帰確認はポート単位の一覧で行っています (2 章)。
 
 ## 8. 検証項目 5: whole-port egress フォールバック
 
 機器 ①。egress 方向の ACL ミラーアクションに対応しない機種 (4220 シリーズなど) 向けの
-代替設定 (マッピング `mirror_egress_mode: "whole-port"`) を検証しました。元スライドの 4220 系エッジスイッチ
-2 台で実際に使われていたハイブリッド構成 (ingress は ACL で絞り込み、egress はポート全体を無条件にミラー、
-同一インスタンス) と同じパターンです。
+代替設定 (マッピング `mirror_egress_mode: "whole-port"`) を検証しました。ingress は ACL で絞り込み、
+egress はポート全体を無条件にミラーする組み合わせを、同一インスタンスで適用します。
 
 ```
 check policy monitor_1_filter        -> Policy file check successful.
