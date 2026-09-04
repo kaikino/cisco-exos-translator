@@ -368,7 +368,7 @@ def _take_acl_port(toks: list[str]) -> tuple[int, int] | None:
 
 
 # parse one ACE line into an AclRule; raises ValueError for anything outside
-# the v1 subset (caller reports it as an unsupported line, never dropped)
+# the supported subset (caller reports it as an unsupported line, never dropped)
 def _parse_ace(text: str, extended: bool, line_no: int) -> AclRule:
     toks = text.split()
     if toks and toks[0].isdigit():  # optional sequence number
