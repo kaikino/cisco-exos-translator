@@ -8,7 +8,8 @@ from .models import ConfigBlock, ScannedLine
 
 # block header patterns
 #   e.g. "vlan 10"  /  "vlan 10,20,30-40"            -> capture "10,20,30-40"
-RE_BLOCK_VLAN = re.compile(r"^vlan\s+(.+)$", re.IGNORECASE)
+#   (only id lists: "vlan internal allocation policy ..." is a global line)
+RE_BLOCK_VLAN = re.compile(r"^vlan\s+([\d,\-\s]+)$", re.IGNORECASE)
 #   e.g. "interface range GigabitEthernet1/0/1-24"   -> capture "GigabitEthernet1/0/1-24"
 RE_BLOCK_IFACE_RANGE = re.compile(r"^interface\s+range\s+(.+)$", re.IGNORECASE)
 #   e.g. "interface GigabitEthernet1/0/1"            -> capture "GigabitEthernet1/0/1"

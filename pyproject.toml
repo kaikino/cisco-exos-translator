@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cisco-exos-translator"
+version = "1.0.0"
+description = "Translate Cisco Catalyst IOS/IOS-XE running-configs into Extreme EXOS (.xsf) scripts and policy files"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+cisco-exos-translate = "cisco_exos_translator.cli:main"
+
+[tool.setuptools]
+packages = ["cisco_exos_translator"]

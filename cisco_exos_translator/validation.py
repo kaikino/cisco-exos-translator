@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 
+from .helpers import interface_sort_key
 from .models import BaseInterface, ParsedConfig, PortChannelInterface
 
 # unsupported-line contexts/texts that belong to an ACL, for incompleteness checks
@@ -42,6 +43,14 @@ def validate_parsed_config(config: ParsedConfig) -> list[str]:
                     f"is referenced but not defined"
                 )
 
+        # Native VLAN exists (tag 1 is exempt: it is the EXOS built-in Default)
+        native = iface.trunk_native_vlan
+        if native is not None and native != 1 and native not in defined_vlans:
+            warnings.append(
+                f"{context_label} {name}: trunk native VLAN {native} "
+                f"is referenced but not defined"
+            )
+
         # Mode consistency checks
         if iface.mode == "access" and (
             iface.trunk_allowed_vlans or iface.trunk_native_vlan is not None
@@ -54,8 +63,8 @@ def validate_parsed_config(config: ParsedConfig) -> list[str]:
                 f"{context_label} {name}: interface has trunk mode but access VLAN set"
             )
 
-    # Check all interfaces (physical and logical)
-    for name, iface in sorted(config.interfaces.items()):
+    # Check all interfaces (physical and logical), in natural port order
+    for name, iface in sorted(config.interfaces.items(), key=lambda kv: interface_sort_key(kv[0])):
         label = "Port-channel" if isinstance(iface, PortChannelInterface) else "Interface"
         check_interface(name, iface, label)
 

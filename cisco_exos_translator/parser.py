@@ -1,4 +1,5 @@
-# parser pass: populate dataclasses from scanned config blocks
+# parser pass: populate dataclasses from scanned config blocks, then run the
+# post-processing and validation passes (parse_cisco_config is the entry point)
 
 from __future__ import annotations
 
@@ -7,6 +8,7 @@ import re
 from .helpers import (
     canonicalize_interface_name,
     expand_interface_range,
+    interface_sort_key,
     netmask_to_cidr,
     parse_interface_identity,
     parse_port_channel_id,
@@ -26,7 +28,14 @@ from .models import (
     UnsupportedLine,
     Vlan,
 )
-from .scanner import RE_BLOCK_ACL, RE_BLOCK_IFACE, RE_BLOCK_IFACE_RANGE, RE_BLOCK_VLAN
+from .scanner import (
+    RE_BLOCK_ACL,
+    RE_BLOCK_IFACE,
+    RE_BLOCK_IFACE_RANGE,
+    RE_BLOCK_VLAN,
+    scan_config,
+)
+from .validation import validate_parsed_config
 
 # command line pattern matching
 
@@ -527,6 +536,9 @@ def _parse_global_block(config: ParsedConfig, block: ConfigBlock) -> None:
         if RE_IP_ROUTING.match(text):
             continue  # realized per-VLAN via "enable ipforwarding vlan"
 
+        if text.lower() == "end":
+            continue  # running-config terminator, not a command
+
         m = RE_MONITOR_SESSION.match(text)
         if m:
             try:
@@ -697,9 +709,10 @@ def _link_port_channel_members(config: ParsedConfig) -> None:
         if iface.canonical_name not in po.members:
             po.members.append(iface.canonical_name)
 
-    # Sort + de-dup members so serialized output is deterministic
+    # Sort (natural port order) + de-dup members so output is deterministic
+    # and the first member is the lowest-numbered port (the default LAG master)
     for po in config.port_channels.values():
-        po.members = sorted(set(po.members))
+        po.members = sorted(set(po.members), key=interface_sort_key)
 
 
 # Ensure a StackMember exists for every stack ID observed on a physical port
@@ -708,4 +721,36 @@ def _infer_stack_members(config: ParsedConfig) -> None:
         if isinstance(iface, PhysicalInterface) and iface.stack_member is not None:
             _get_or_create_stack_member(config, iface.stack_member)
 
+
+# Parse Cisco IOS/IOS-XE running-config text into a ParsedConfig IR.
+# Orchestrates: scanner -> per-block parsers -> post-processing -> validation.
+def parse_cisco_config(text: str) -> ParsedConfig:
+    config = ParsedConfig()
+
+    # Pass 1: scanner (text -> blocks)
+    blocks = scan_config(text)
+
+    # Pass 2: block parsers (explicit_allowed is shared across blocks so a
+    # later "add/remove" can tell whether the trunk list was set explicitly)
+    explicit_allowed: set[str] = set()
+    for block in blocks:
+        if block.kind == "global":
+            _parse_global_block(config, block)
+        elif block.kind == "vlan":
+            _parse_vlan_block(config, block)
+        elif block.kind == "acl":
+            _parse_acl_block(config, block)
+        elif block.kind == "interface":
+            _parse_interface_block(config, block, is_range=False, explicit_allowed=explicit_allowed)
+        elif block.kind == "interface_range":
+            _parse_interface_block(config, block, is_range=True, explicit_allowed=explicit_allowed)
+
+    # Pass 3: post-processing
+    _link_port_channel_members(config)
+    _infer_stack_members(config)
+
+    # Pass 4: cross-reference validation
+    config.warnings.extend(validate_parsed_config(config))
+
+    return config
 

@@ -6,7 +6,13 @@ from __future__ import annotations
 
 import re
 
+from .helpers import interface_sort_key
 from .models import ParsedConfig, PhysicalInterface, PortChannelInterface
+
+
+# sort key for (canonical name, interface) items: natural port order
+def _by_port(item: tuple) -> tuple:
+    return interface_sort_key(item[0])
 
 
 # SVIs ("interface Vlan10") are logical L3 interfaces, not ports; excluded from
@@ -170,7 +176,7 @@ def build_default_mapping(config: ParsedConfig) -> dict:
     }
 
     ports: dict[str, str] = {}
-    for name, iface in sorted(config.interfaces.items()):
+    for name, iface in sorted(config.interfaces.items(), key=_by_port):
         if isinstance(iface, PhysicalInterface) and not _is_svi(iface):
             ports[name] = _exos_port(iface, stacked)
 
@@ -178,7 +184,7 @@ def build_default_mapping(config: ParsedConfig) -> dict:
     for po_id, po in sorted(config.port_channels.items()):
         if not po.members:
             continue
-        member_ports = [ports[m] for m in sorted(po.members) if m in ports]
+        member_ports = [ports[m] for m in po.members if m in ports]
         if not member_ports:
             continue
         lacp = _lacp_for_modes(po_id, _member_modes(config, po), throwaway)
@@ -284,7 +290,14 @@ def _membership_lines(
     return lines
 
 
+# "any IPv4" match used wherever a Cisco rule has no explicit condition
+# ("permit/deny ip any any" and the implicit deny): an empty EXOS match would
+# also catch non-IP traffic such as ARP, which a Cisco IP ACL never touches
+_MATCH_ANY_IPV4 = "source-address 0.0.0.0/0"
+
+
 # Match conditions of one parsed ACE as policy-file condition strings
+# (never empty: an unconditional Cisco ACE becomes an any-IPv4 match)
 def _ace_conditions(r) -> list[str]:
     conds = []
     if r.protocol:
@@ -301,7 +314,7 @@ def _ace_conditions(r) -> list[str]:
         conds.append(
             f"destination-port {lo}" if lo == hi else f"destination-port {lo} - {hi}"
         )
-    return conds
+    return conds or [_MATCH_ANY_IPV4]
 
 
 # Render one policy entry: conditions plus one or more action statements
@@ -332,13 +345,7 @@ def _acl_policy(acl_name: str, rules) -> str:
     # match all IPv4 (not an empty match): Cisco's implicit deny applies to IP
     # traffic only -- an unconditional deny here would also drop ARP etc.
     lines.append("# Cisco implicit deny (IPv4 only)")
-    lines.append("entry implicit_deny {")
-    lines.append("    if {")
-    lines.append("        source-address 0.0.0.0/0;")
-    lines.append("    } then {")
-    lines.append("        deny;")
-    lines.append("    }")
-    lines.append("}")
+    _policy_entry(lines, "implicit_deny", [_MATCH_ANY_IPV4], ["deny"])
     return "\n".join(lines) + "\n"
 
 
@@ -481,7 +488,7 @@ def _plan_mirrors(
         for cname, direction in sess.source_ports:
             iface = config.interfaces.get(cname)
             if isinstance(iface, PortChannelInterface):
-                targets = [port_map[m] for m in sorted(iface.members) if m in port_map]
+                targets = [port_map[m] for m in iface.members if m in port_map]
                 if not targets:
                     warnings.append(
                         f"monitor session {sid}: source {cname} has no member "
@@ -679,7 +686,7 @@ def _translation_reference(
     # Ports: Cisco name -> EXOS port (skip routed, which are out of L2 scope)
     port_items = [
         (name, port_map[name])
-        for name in sorted(port_map)
+        for name in sorted(port_map, key=interface_sort_key)
         if getattr(config.interfaces.get(name), "mode", None) != "routed"
     ]
     if port_items:
@@ -743,7 +750,7 @@ def generate_exos_config(
     port_map: dict[str, str] = dict(mapping.get("ports") or {})
     _resolve_uplinks(port_map, mapping.get("uplinks"), warnings)
     collisions: dict[str, list[str]] = {}
-    for name, exos in sorted(port_map.items()):
+    for name, exos in sorted(port_map.items(), key=_by_port):
         iface = config.interfaces.get(name)
         if getattr(iface, "mode", None) == "routed":
             continue  # excluded from output anyway
@@ -776,7 +783,7 @@ def generate_exos_config(
                 f"Port-channel{po_id}: no member ports; skipped in EXOS output"
             )
             continue
-        member_ports = [port_map[m] for m in sorted(po.members) if m in port_map]
+        member_ports = [port_map[m] for m in po.members if m in port_map]
         if not member_ports:
             continue
         default_lacp = _lacp_for_modes(po_id, _member_modes(config, po), warnings)
@@ -862,6 +869,15 @@ def generate_exos_config(
         po = config.port_channels[po_id]
 
         out.append(f"# Port-channel{po_id}")
+        # Member ports keep their own descriptions; the bundle's description
+        # goes on the master last so it wins there
+        for canonical in po.members:
+            m_iface = config.interfaces.get(canonical)
+            if isinstance(m_iface, PhysicalInterface) and m_iface.description and canonical in port_map:
+                out.append(
+                    f'configure ports {port_map[canonical]} '
+                    f'description-string "{m_iface.description}"'
+                )
         if po.description:
             out.append(f'configure ports {master} description-string "{po.description}"')
         out.extend(_membership_lines(master, po, vlan_names, warnings))
@@ -869,13 +885,13 @@ def generate_exos_config(
             out.append(f"disable ports {master}")
 
         # An individually shut-down member is still disabled
-        for canonical in sorted(po.members):
+        for canonical in po.members:
             m_iface = config.interfaces.get(canonical)
-            if isinstance(m_iface, PhysicalInterface) and m_iface.shutdown:
+            if isinstance(m_iface, PhysicalInterface) and m_iface.shutdown and canonical in port_map:
                 out.append(f"disable ports {port_map[canonical]}")
 
     # Standalone physical ports (not bundled, not routed, not SVIs)
-    for name, iface in sorted(config.interfaces.items()):
+    for name, iface in sorted(config.interfaces.items(), key=_by_port):
         if not isinstance(iface, PhysicalInterface):
             continue
         if name in bundled:
@@ -932,7 +948,7 @@ def generate_exos_config(
 
     # L3: addressed SVIs -> VLAN IP + per-VLAN forwarding, then static routes
     l3_lines: list[str] = []
-    for name, iface in sorted(config.interfaces.items()):
+    for name, iface in sorted(config.interfaces.items(), key=_by_port):
         if not (isinstance(iface, PhysicalInterface) and _is_svi(iface) and iface.ip_address):
             continue
         vid = _svi_vlan_id(iface)
@@ -957,7 +973,7 @@ def generate_exos_config(
     # .pol files must be on the switch before this script is loaded
     # Targets: switchports -> "ports N"; SVIs (router ACLs) -> 'vlan "NAME"'
     applied: dict[str, list[str]] = {}  # acl name -> EXOS apply targets
-    for name, iface in sorted(config.interfaces.items()):
+    for name, iface in sorted(config.interfaces.items(), key=_by_port):
         acl = iface.access_group_in
         if not acl:
             continue

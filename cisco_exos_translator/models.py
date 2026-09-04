@@ -64,7 +64,7 @@ class PhysicalInterface(BaseInterface):
     stack_member: Optional[int] = None
     module: Optional[int] = None
     port: Optional[int] = None
-    channel_group: Optional[int] = None # which bundle this port joins
+    channel_group: Optional[int] = None  # which bundle this port joins
     channel_mode: Optional[str] = None
 
 
@@ -82,8 +82,8 @@ class PortChannelInterface(BaseInterface):
 
 
 # one Cisco SPAN session ("monitor session N ...") accumulated across its
-# global config lines; only local SPAN is representable (RSPAN/ERSPAN and
-# filters are reported as unsupported lines by the parser)
+# global config lines; only local SPAN (optionally ACL-filtered) is
+# representable -- RSPAN/ERSPAN are reported as unsupported lines by the parser
 @dataclass
 class MonitorSession:
     session_id: int
@@ -126,16 +126,7 @@ class ParsedConfig:
     unsupported_lines: list[UnsupportedLine] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
-    # Physical ports only, keyed by canonical name (sorted)
-    @property
-    def physical_interfaces(self) -> dict[str, PhysicalInterface]:
-        return {
-            name: iface
-            for name, iface in sorted(self.interfaces.items())
-            if isinstance(iface, PhysicalInterface)
-        }
-
-    # ort-channel bundles, keyed by bundle id (sorted)
+    # Port-channel bundles, keyed by bundle id (sorted)
     @property
     def port_channels(self) -> dict[int, PortChannelInterface]:
         bundles = (
@@ -157,7 +148,7 @@ class ScannedLine:
 # a top-level or nested configuration block extracted by the scanner
 @dataclass
 class ConfigBlock:
-    kind: str  # "global" | "vlan" | "interface" | "interface_range"
+    kind: str  # "global" | "vlan" | "acl" | "interface" | "interface_range"
     header: Optional[ScannedLine]
     body: list[ScannedLine]
     context: str

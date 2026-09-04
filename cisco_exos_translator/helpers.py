@@ -8,6 +8,8 @@ from typing import Optional
 # Canonical long names for each interface type we recognize.
 INTERFACE_TYPE_NAMES = [
     "TwentyFiveGigE",
+    "TwoGigabitEthernet",
+    "FiveGigabitEthernet",
     "TenGigabitEthernet",
     "FortyGigabitEthernet",
     "HundredGigE",
@@ -16,9 +18,12 @@ INTERFACE_TYPE_NAMES = [
     "Port-channel",
 ]
 
-# Abbreviated prefix -> canonical long name
+# Abbreviated prefix -> canonical long name (longer prefixes first so "Twe"
+# is not swallowed by "Tw")
 INTERFACE_ABBREV_MAP: list[tuple[str, str]] = [
     ("Twe", "TwentyFiveGigE"),
+    ("Tw", "TwoGigabitEthernet"),
+    ("Fi", "FiveGigabitEthernet"),
     ("Te", "TenGigabitEthernet"),
     ("Fo", "FortyGigabitEthernet"),
     ("Hu", "HundredGigE"),
@@ -164,7 +169,20 @@ def parse_port_channel_id(name: str) -> Optional[int]:
     return int(match.group(1)) if match else None
 
 
-# Expand interface range notation into sorted, normalized names
+# Natural sort key for interface names: physical ports first, ordered by type
+# then numerically by stack/module/port (Gi1/0/2 before Gi1/0/10), then
+# Port-channels by id, then anything else (SVIs, ...) by name
+def interface_sort_key(name: str) -> tuple:
+    canonical = canonicalize_interface_name(name)
+    iface_type, member, module, port = parse_interface_identity(canonical)
+    if iface_type == "Port-channel":
+        return (1, iface_type, parse_port_channel_id(canonical) or 0, 0, 0, canonical)
+    if member is None:
+        return (2, iface_type, 0, 0, 0, canonical)
+    return (0, iface_type, member, module or 0, port or 0, canonical)
+
+
+# Expand interface range notation into naturally sorted, normalized names
 def expand_interface_range(text: str) -> list[str]:
     text = text.strip()
     if not text:
@@ -197,4 +215,4 @@ def expand_interface_range(text: str) -> list[str]:
     if not result:
         raise ValueError(f"no interfaces expanded from {text!r}")
 
-    return sorted(result)
+    return sorted(result, key=interface_sort_key)

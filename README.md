@@ -13,6 +13,15 @@ in, one EXOS `.xsf` out. There is no multi-switch topology correlation.
 python3 main.py <cisco_config.cfg> [<cisco_config2.cfg> ...]
 ```
 
+Python 3.9+, standard library only. `pip install -e .` additionally installs
+the same entry point as the `cisco-exos-translate` command. Japanese
+documentation for partner engineers lives in [docs/](docs/): usage manual
+([docs/usage.md](docs/usage.md)), architecture ([docs/architecture.md](docs/architecture.md)),
+ACL pattern scope ([docs/acl-patterns.md](docs/acl-patterns.md)), automated
+test documentation with results ([docs/software-testing.md](docs/software-testing.md)),
+and hardware validation on Extreme switches ([docs/hardware-testing.md](docs/hardware-testing.md)).
+Superseded documents are kept in [docs_old/](docs_old/) for reference.
+
 For each input, writes two files alongside it:
 
 - **`<name>.map.json`** — the translation mapping (VLAN names, Cisco→EXOS port
@@ -105,8 +114,10 @@ running-config text
   is expanded to every non-Default VLAN defined on the switch (warned).
 - **Referenced-but-undefined VLANs** are auto-created in the output (with a
   warning) so the `.xsf` is valid; tag 1 is exempt (maps to `Default`).
-- **LAG master** is the lowest-numbered member; member ports are excluded from
-  individual VLAN assignment (their L2 config comes from the bundle).
+- **LAG master** is the lowest-numbered member (natural port order, so
+  `Gi1/0/9` precedes `Gi1/0/10`); member ports are excluded from individual
+  VLAN assignment (their L2 config comes from the bundle) but keep their own
+  `description`.
 - **Stack detection**: more than one stack member ⇒ `slot:port` port naming.
 - **Mirroring (SPAN)**: each session maps to an EXOS mirror instance named
   `monitor_<id>` by default (rename via the mapping's `mirrors` section; set it
@@ -124,7 +135,7 @@ running-config text
   the script non-interactive (EXOS otherwise raises a y/N prompt about
   removing the monitor port's VLAN membership). Hardware-validated on an
   X440-G2 and a 2-node SummitStack, see
-  [docs/mirror-hw-test.md](docs/mirror-hw-test.md).
+  [docs/hardware-testing.md](docs/hardware-testing.md).
 - **Filtered mirroring (FSPAN)**: `monitor session N filter ip access-group
   <ACL>` mirrors only the ACL-permitted traffic instead of the whole source
   port — the pattern used to mirror just ICMP to/from a monitoring host
@@ -145,7 +156,7 @@ running-config text
   mirrored unfiltered (`configure mirror <name> add port <p> egress`) while
   ingress stays ACL-filtered, matching the deployed pattern this feature was
   modeled on. Hardware-validated on X440-G2 (both `acl` and `whole-port`
-  modes), see [docs/mirror-hw-test.md](docs/mirror-hw-test.md).
+  modes), see [docs/hardware-testing.md](docs/hardware-testing.md).
 
 ## Warnings the generator emits
 
@@ -186,7 +197,10 @@ Embedded as `#` comments at the top of each `.xsf`:
   emitted as a `{uplink-mN-pM}` placeholder for manual replacement.
 - **ACL edge cases** — supported subset is permit/deny, `ip|tcp|udp|icmp`/
   numeric protocol, `any`/`host`/contiguous wildcard, numeric `eq`/`range`
-  ports, `remark`, interface `in`. Everything else (`established`, `log`,
+  ports, `remark`, interface `in`. An unconditional ACE (`permit|deny ip any
+  any`) is rendered as an any-IPv4 match (`source-address 0.0.0.0/0`), like
+  the implicit deny, so it never catches non-IP traffic such as ARP.
+  Everything else (`established`, `log`,
   `gt/lt/neq`, named ports, non-contiguous wildcards, object-groups, `out`
   direction, vty/SNMP/route-map contexts) is reported, never silently dropped;
   ACLs with untranslated rules get an "incomplete" warning. See
@@ -205,13 +219,24 @@ Embedded as `#` comments at the top of each `.xsf`:
 ## Layout
 
 ```
-main.py                         CLI entry point + pipeline orchestration
+main.py                         CLI entry point (thin wrapper around cli.py)
 cisco_exos_translator/
+  __init__.py                   public API (parse_cisco_config, generate_exos_config, ...)
+  cli.py                        argument handling, output files, mapping round-trip
   scanner.py                    running-config text → ConfigBlocks
-  parser.py                     ConfigBlocks → ParsedConfig IR
+  parser.py                     ConfigBlocks → ParsedConfig IR (+ post-processing, validation)
   models.py                     dataclasses (Vlan, interfaces, ParsedConfig, ...)
   validation.py                 cross-reference checks (warnings)
   mapping.py                    .map.json read/write/merge
-  generator.py                  ParsedConfig + mapping → EXOS .xsf
-  helpers.py                    VLAN list / interface name parsing
+  generator.py                  ParsedConfig + mapping → EXOS .xsf / .pol / stack runbook
+  helpers.py                    VLAN list / interface name / address parsing
+tests/                          unittest suite (python3 -m unittest)
+docs/                           Japanese documentation: usage, architecture, ACL patterns, software & hardware testing
+docs_old/                       superseded documents, kept for reference
+```
+
+## Tests
+
+```bash
+python3 -m unittest
 ```
